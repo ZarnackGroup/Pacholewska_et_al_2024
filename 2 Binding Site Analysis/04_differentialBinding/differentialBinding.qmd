@@ -1,0 +1,472 @@
+---
+title: "SF3B1 iCLIP analysis"
+subtitle: "Differential binding"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+author: 
+ - name: "Dr. Mirko Brueggemann"
+   email: mirko.brueggemann@bmls.de
+   affiliations:
+      - name: Buchman Institute for Molecular Life Sciences
+format: 
+    html:
+        theme: sandstone
+        code-fold: TRUE
+        code-overflow: scroll
+        code-summary: "Show code"
+        code-tools: TRUE
+        toc: TRUE
+        toc-depth: 3
+        toc-location: left
+        number-sections: TRUE
+        self-contained: TRUE
+        fontsize: 11pt
+crossref: 
+    fig-title: '**Figure**'
+    fig-labels: arabic
+    title-delim: "**.**"
+code-block-bg: "#EEEEEE"
+editor: 
+    markdown: 
+      wrap: 120
+---
+
+# Analysis description
+
+# Load libraries
+
+```{r}
+#| label: libraries
+#| message: false
+library(rtracklayer)
+library(GenomicRanges)
+library(ggplot2)
+library(AnnotationDbi)
+library(dplyr)
+library(reshape2)
+library(UpSetR)
+library(GenomicFeatures)
+library(kableExtra)
+library(knitr)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(viridis)
+library(BiocParallel)
+library(DESeq2)
+library(gplots)
+library(ComplexHeatmap)
+library(circlize)
+library(GGally)
+library(factoextra)
+library(plotROC)
+library(PRROC)
+library(ggrastr)
+library(ggbeeswarm)
+library(ggpointdensity)
+library(tidyr)
+library(ggridges)
+library(ggsci)
+library(ggnewscale)
+library(ggrastr)
+library(Cairo)
+library(ggforce)
+library(patchwork)
+library(dplyr)
+library(tibble)
+library(forcats)
+library(stringr)
+library(RColorBrewer)
+library(ggpubr)
+library(BindingSiteFinder)
+library(Gviz)
+library(ggpubr)
+```
+
+```{r}
+#| label: load additional scripts
+#| message: false
+source("../styles.R")
+source("../helper.R")
+```
+
+
+# Differential binding 
+
+Here we test whether SF3B1 changes its affinity to defined binding sites in the mutant condition (compared to the wt). This is done by using the DESeq2 NB model with the LRT (likelihood ratio test), to compare changes in binding sites to changes in the respective hosting gene. Essentially, we account for RNA abundance changes by approximating the transcript expression level by all iCLIP counts that do not end up in a binding site. We call this background counts. The DESeq2 model essentially uses these background counts to find binding sites that change independently from the underlying transcript level change, thus disentangling both signals. 
+
+```{r}
+#| label: load gene annotation
+#| message: false
+load("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.rda")
+anno.db = loadDb("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.sqlite")
+gns = genes(anno.db)
+idx = match(gns$gene_id, anno$gene_id)
+elementMetadata(gns) = cbind(elementMetadata(gns), elementMetadata(anno)[idx,])
+names(gns) = sub("\\..*", "", names(gns))
+meta = data.frame(gene_id = gns$gene_id, gene_name = gns$gene_name, gene_type = gns$gene_type)
+mcols(gns) = meta
+gns$geneID = names(gns)
+```
+
+```{r}
+#| label: load clip data
+#| message: false
+load("/Users/mirko/Projects/sf3b1/02_markdowns/01_transcriptome/01_bindingSites/data/bsTranscript.rda")
+bindingSites = bsTranscript
+
+# Load clip data
+clipFilesWt = "/Users/mirko/Projects/sf3b1/01_data_subsamp/wt/cov/replicate"
+clipFilesMut = "/Users/mirko/Projects/sf3b1/01_data_subsamp/mut/cov/replicate"
+clipFiles = c(clipFilesWt, clipFilesMut)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "Plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "Minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+    id = c(1:5),
+    condition = factor(c("MUT", "MUT", "WT", "WT", "WT"), levels = c("MUT", "WT")),
+    clPlus = clipFilesP,
+    clMinus = clipFilesM)
+# Make BindingSiteFinder object
+bds = BSFDataSetFromBigWig(ranges = bindingSites, meta = colData)
+```
+
+```{r}
+#| label: compute differences
+#| message: false
+#| warning: false
+# compute the binding site and background coverage
+bds.diff = calculateBsBackground(bds, anno.genes = gns)
+
+# filter background 
+bds.diff = filterBsBackground(bds.diff)
+
+# compute fold-changes
+bds.diff = calculateBsFoldChange(bds.diff)
+```
+
+## Gene-wise pre-filtering 
+
+::: {.panel-tabset}
+
+### Filter minCount
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: minCount filter
+plotBsBackgroundFilter(bds.diff, filter = "minCounts")
+```
+
+### Filter balanceBackground
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: balanceBackground filter
+plotBsBackgroundFilter(bds.diff, filter = "balanceBackground") 
+```
+
+### Filter balanceCondition
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: balanceCondition filter
+plotBsBackgroundFilter(bds.diff, filter = "balanceCondition")
+```
+
+:::
+
+## Binding site level results
+
+```{r}
+#| message: false
+df = getRanges(bds.diff) %>%
+    as.data.frame() %>%
+    mutate(bs.padj = replace_na(bs.padj, 1)) %>%
+    mutate(sig = ifelse(bs.padj < 0.05, TRUE, FALSE)) %>% 
+    group_by(sig, region) %>%
+    summarize(n = myFormat(n())) 
+
+kable(df, caption = "Result overview") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+
+::: {.panel-tabset}
+
+### MA plot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: MA plot
+plotBsMA(bds.diff)
+```
+
+### Volcano plot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Volcano plot
+plotBsVolcano(bds.diff)
+```
+
+:::
+
+
+## Gene level results
+
+```{r}
+#| message: false
+df = getRanges(bds.diff) %>%
+    as.data.frame() %>%
+    mutate(bg.padj = replace_na(bg.padj, 1)) %>%
+    mutate(sig = ifelse(bg.padj < 0.05, TRUE, FALSE)) %>% 
+    group_by(sig, region) %>%
+    summarize(n = myFormat(n())) 
+
+kable(df, caption = "Result overview") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+
+::: {.panel-tabset}
+
+### MA plot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: MA plot
+plotBsMA(bds.diff, what = "bg")
+```
+
+### Volcano plot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Volcano plot
+plotBsVolcano(bds.diff, what = "bg")
+```
+
+:::
+
+
+# Integration with peak clustering
+
+First binding sites are overlapped with classified peak regions from the clustering approach. This results in binding sites overlapping one of the four categories (DoubleWide, DoubleNarrow, Single, Rest). The DoubleWide peak class is further split in the left and right side. Each side can overlap with multiple binding sites, resulting in muliple LFCs, P-values, ect for each side. To resolve the issue values from the binding site with the lowest P value were taken as representative. 
+
+```{r}
+# load peak classification from clustering
+peakClass = rtracklayer::import.bed("../02_peakClassification/data/rngClassified.bed")
+peakClass$group = sapply(strsplit(peakClass$name,"_"), `[`, 1)
+
+# group peaks by classification
+peakList = split(peakClass, peakClass$group)
+# bsRes = searchRes$obj
+bsRes = getRanges(bds.diff)
+
+# get binding site LFCs, P-values, ect for binding sites in peak regions
+olBs = subsetByOverlaps(bsRes,peakList$DoubleNarrow)
+df1 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "DoubleNarrow")
+olBs = subsetByOverlaps(bsRes,peakList$DoubleWide)
+df2 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "DoubleWide")
+olBs = subsetByOverlaps(bsRes,peakList$Rest)
+df3 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "Rest")
+olBs = subsetByOverlaps(bsRes,peakList$SinglePeak)
+df4 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "SinglePeak")
+
+# split double-wide peaks in left and right side
+# -> based on midpoint
+# -> left/ right switches with the strand
+doublePeaks = peakList$DoubleWide
+doublePeaks$doublePeakID = doublePeaks$name
+doublePeaksP = doublePeaks[strand(doublePeaks) == "+"]
+doublePeaksM = doublePeaks[strand(doublePeaks) == "-"]
+doublePeaksP = as(slidingWindows(x = doublePeaksP, width = 41, step = 41), "GRangesList")
+doublePeaksM = as(slidingWindows(x = doublePeaksM, width = 41, step = 41), "GRangesList")
+
+doublePart1P = as(lapply(doublePeaksP, function(x){x[1]}),"GRangesList") %>% unlist()
+doublePart2P = as(lapply(doublePeaksP, function(x){x[2]}),"GRangesList") %>% unlist()
+doublePart1M = as(lapply(doublePeaksM, function(x){x[2]}),"GRangesList") %>% unlist()
+doublePart2M = as(lapply(doublePeaksM, function(x){x[1]}),"GRangesList") %>% unlist()
+
+doublePart1 = c(doublePart1P, doublePart1M)
+mcols(doublePart1)$doublePeakID = doublePeaks$name
+export(doublePart1, con = "./data/LeftPartFar.bed", format = "BED")
+doublePart2 = c(doublePart2P, doublePart2M)
+mcols(doublePart2)$doublePeakID = doublePeaks$name
+export(doublePart2, con = "./data/RightPartClose.bed", format = "BED")
+
+olBs = subsetByOverlaps(bsRes, doublePart1)
+df5 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "DoubleWide-Left")
+olBs = subsetByOverlaps(bsRes, doublePart2)
+df6 = data.frame(BsID = olBs$bsID, GeneID = olBs$geneID, lfc = olBs$bs.log2FoldChange, padj = olBs$bs.padj, peakType = "DoubleWide-Right")
+```
+
+## Grouping by peak classification
+
+### All
+
+::: {.panel-tabset}
+
+### Violin
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Violin chart
+
+df = rbind(df1,df2,df3,df4,df5,df6)
+df$peakType = factor(df$peakType, levels = c("DoubleWide", "DoubleNarrow", "SinglePeak", "Rest", "DoubleWide-Left", "DoubleWide-Right"))
+
+p1 = ggplot(df, aes(x = peakType, y = lfc, fill = peakType)) +
+  geom_violin(adjust = 1, trim = T) +
+  geom_boxplot(width = 0.5, fill = "white", outlier.size = 0.5) +
+  theme_nice() +
+  scale_fill_npg() +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "", y = "Fold-change (log2)") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+p1
+```
+
+### Boxplot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Boxplot
+
+p2 = ggplot(df, aes(x = peakType, y = lfc, fill = peakType)) +
+  geom_boxplot(outlier.colour = NA) +
+  theme_nice() +
+  scale_fill_npg() +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "", y = "Fold-change (log2)") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  coord_cartesian(ylim = c(-0.7,0.7)) +
+  stat_compare_means(comparisons = list(c("DoubleWide-Left", "DoubleWide-Right")), label = "p.signif", method = "wilcox.test", label.y = 0.25) 
+
+p2
+```
+
+### Barchart
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Barchart
+
+d = df %>% group_by(peakType) %>% summarise(n = n())
+p3 = ggplot(d, aes(x = peakType, y = n, fill = peakType)) + 
+  geom_col() +
+  scale_fill_npg() +
+  geom_text(aes(label = n), vjust=-0.3, size = 2) +
+  theme_nice() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "N (BS)") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+p3
+```
+
+:::
+
+### Cleaned
+
+::: {.panel-tabset}
+
+### V1
+
+```{r, fig.width=4, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+#| fig-cap: V1
+df = rbind(df1,df2,df3,df4,df5,df6) %>% filter(peakType != "Rest")
+df$peakType = factor(df$peakType, levels = c("SinglePeak", "DoubleNarrow", "DoubleWide", "DoubleWide-Left", "DoubleWide-Right"))
+compList = list(c("DoubleWide-Left", "DoubleWide-Right"), c("DoubleWide", "DoubleWide-Right"), c("DoubleWide-Left", "DoubleWide"))
+
+# count number of obs per box
+d = df %>% 
+    group_by(peakType) %>% 
+    summarise(n = n()) %>%
+    mutate(nNice = paste0("N=", format(n, big.mark = ".", decimal = ","))) 
+
+p1 = ggplot(df, aes(x = peakType, y = lfc, fill = peakType)) +
+    geom_boxplot(outlier.colour = NA) +
+    theme_pub() +
+    scale_fill_npg() +
+    theme(legend.position = "none") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = "", y = "Fold-change (log2)") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    coord_cartesian(ylim = c(-1,1)) +
+    stat_compare_means(comparisons = compList, label = c("p.format"), method = "wilcox.test", label.y = c(0.45,0.6,0.3), tip.length = 0.01, size = 2) +
+    geom_text(data = d, aes(x = peakType, y = -0.8, label = nNice), size = 2, angle = 90) 
+p1
+```
+
+### V2
+
+```{r, fig.width=4, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+#| fig-cap: V2
+
+p2 = ggplot(df, aes(x = peakType, y = lfc, fill = peakType)) +
+    geom_boxplot(outlier.colour = NA) +
+    theme_pub() +
+    scale_fill_grey() +
+    theme(legend.position = "none") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(x = "", y = "Fold-change (log2)") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    coord_cartesian(ylim = c(-1,1)) +
+    stat_compare_means(comparisons = compList, label = c("p.format"), method = "wilcox.test", label.y = c(0.45,0.6,0.3), tip.length = 0.01, size = 2) +
+    geom_text(data = d, aes(x = peakType, y = -0.8, label = nNice), size = 2, angle = 90) 
+
+p2
+```
+
+:::
+
+
+# Session Information
+
+```{r, session_info, include=TRUE, echo=TRUE, results='markup'}
+sessionInfo()
+```

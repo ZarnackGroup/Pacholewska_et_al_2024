@@ -1,0 +1,1088 @@
+---
+title: "SF3B1 iCLIP analysis"
+subtitle: "Binding site clustering"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+author: 
+ - name: "Dr. Mirko Brueggemann"
+   email: mirko.brueggemann@bmls.de
+   affiliations:
+      - name: Buchman Institute for Molecular Life Sciences
+format: 
+    html:
+        theme: sandstone
+        code-fold: TRUE
+        code-overflow: scroll
+        code-summary: "Show code"
+        code-tools: TRUE
+        toc: TRUE
+        toc-depth: 3
+        toc-location: left
+        number-sections: TRUE
+        self-contained: TRUE
+        fontsize: 11pt
+crossref: 
+    fig-title: '**Figure**'
+    fig-labels: arabic
+    title-delim: "**.**"
+code-block-bg: "#EEEEEE"
+editor: 
+    markdown: 
+      wrap: 120
+---
+
+# Analysis Description
+
+In this report we describe how binding sites are classified in groups based on their distance patterns. The main idea is that muliple peaks in close proximity are combined into a single region first. These regions are then fitted into a turned into smoothed coverage profiles, which can be represented as Uniform Manifold Approximation and Projection (UMAP) and further classified using DBSCAN
+
+# Load libraries
+
+```{r}
+#| label: libraries
+#| message: false
+# genomics
+library(rtracklayer)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(AnnotationDbi)
+library(BindingSiteFinder)
+
+# Data format
+library(factoextra)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(forcats)
+
+# visuals - plotting
+library(ggplot2)
+library(ggridges)
+library(ggrastr)
+library(ggpointdensity)
+library(ggsci)
+library(ggtext)
+library(patchwork)
+library(circlize)
+library(viridis)
+library(ggrepel)
+library(ComplexHeatmap)
+
+# visuals - format
+library(kableExtra)
+library(knitr)
+library(gridExtra)
+library(grid)
+
+# calculation
+library(matrixStats)
+library(umap)
+library(fpc)
+library(dbscan)
+library(multimode)
+```
+
+```{r}
+#| label: load additional scripts
+#| message: false
+source("../styles.R")
+source("../helper.R")
+```
+
+
+# Prepartion of regions
+
+At first binding sites closer to each other than 55nt are merged. Merged regions are then symmetrically extended to form 81nt wide bins.
+
+```{r}
+#| label: load clip data
+#| message: false
+load("/Users/mirko/Projects/sf3b1/02_markdowns/03_clean/01_bindingSites/data/bsTranscript.rda")
+# Load clip data
+clipFilesWt = "/Users/mirko/Projects/sf3b1/01_data_subsamp/wt/cov/replicate"
+clipFilesMut = "/Users/mirko/Projects/sf3b1/01_data_subsamp/mut/cov/replicate"
+clipFiles = c(clipFilesWt, clipFilesMut)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "Plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "Minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = c(1:5),
+  condition = factor(c("WT", "WT", "WT", "WT", "WT"), levels = c("WT")),
+                     clPlus = clipFilesP,
+                     clMinus = clipFilesM)
+# Make BindingSiteFinder object
+bds = BSFDataSetFromBigWig(ranges = bsTranscript, meta = colData)
+```
+
+## Distance pattern for binding sites in introns
+
+::: {.panel-tabset}
+
+### Zoom-Out
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distance from each binding site to the next closest neighbor.
+
+bsIntron = subset(bsTranscript, bsTranscript$region == "intron")
+
+dist = distanceToNearest(bsIntron) %>% as.data.frame()
+bsIntron$dist = dist$distance
+ggplot(dist, aes(x = log10(distance+1))) + 
+  geom_histogram(bins = 100, color = "black") + 
+  theme_nice() +
+  labs(
+    title = "Distance to nearest binding site",
+    x = "Distance +1 (nt) [log10]",
+    y = "Count") 
+
+```
+
+### Zoom-In
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distance from each binding site to the next closest neighbor in a range of 50 nt.
+ggplot(dist, aes(x = distance)) + 
+  geom_histogram(binwidth = 1, color = "black") + 
+  xlim(-1,50) +
+  theme_nice() +
+  labs(
+    title = "Distance to nearest binding site",
+    x = "Distance (nt) [0-50]",
+    y = "Count") +
+  geom_vline(xintercept = 7, linetype = "dashed")
+```
+
+:::
+
+## Transform the iCLIP signal
+
+To avoid that the height of the coverage influences our downstream clustering, the signal in each bin is scaled between 0 and 1. Next a spline transformation is applied to produced a smoothed version of the coverage, which boosts classification performance. After testing different lambda values (0.2, 0.3, 0.4) we decided from the heatmaps below to continue with `lambda = 0.2` and a dimension `dim = 150`. 
+
+```{r}
+#| label: prepare ranges
+#| message: false
+# combine all BS within 41 nt range
+mergedRange = reduce(bsIntron, min.gapwidth = 55, with.revmap = TRUE)
+mergedRange$width = width(mergedRange)
+# add bs count info 
+nBS = sapply(mergedRange$revmap, length)
+mcols(mergedRange)$nBS = nBS
+
+# resize ranges to their center position and extend all ranges to 81 nt
+rngSel = resize(granges(mergedRange), fix = "center", width = 81)
+names(rngSel) = 1:length(rngSel)
+
+export(mergedRange, "./data/mergedRange.bed", format = "BED")
+export(rngSel, "./data/rngSel.bed", format = "BED")
+
+saveRDS(mergedRange, file = "./data/mergedRange.rds")
+saveRDS(rngSel, file = "./data/rngSel.rds")
+```
+
+```{r}
+#| label: prepare matrix
+#| message: false
+bdsSel = setRanges(bds, rngSel)
+cov = coverageOverRanges(bdsSel, returnOptions = "merge_all_replicates")
+masterMM = cov
+
+# normalize matrix
+normMM = minMaxNorm(masterMM)
+
+# # apply different smoothing levels
+smoothMM_par1 <- t(apply(normMM, 1, smoothing, lambda=0.2, dim=151))
+smoothMM_par2 <- t(apply(normMM, 1, smoothing, lambda=0.3, dim=151))
+smoothMM_par3 <- t(apply(normMM, 1, smoothing, lambda=0.4, dim=151))
+saveRDS(smoothMM_par1, file = "./data/smoothMM_par1.rds")
+saveRDS(smoothMM_par2, file = "./data/smoothMM_par2.rds")
+saveRDS(smoothMM_par3, file = "./data/smoothMM_par3.rds")
+```
+
+## Smooting levels
+
+::: {.panel-tabset}
+
+### Smooth 0.2
+
+```{r, fig.width=4, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+#| fig-cap: Heatmaps of smoothed binding site signal with level 0.2
+set.seed(1234)
+custom.col = viridis(10, option = "G", direction = -1)
+
+idx = sample(1:(nrow(smoothMM_par1)), 500)
+
+m1 = smoothMM_par1[idx,]
+m2 = smoothMM_par2[idx,]
+m3 = smoothMM_par3[idx,]
+
+h1 = Heatmap(m1, column_title = "Smooth 0.2", name = "Xlinks",
+             cluster_columns = F, cluster_rows = T,
+             show_row_names = FALSE,
+             show_column_names = T, border = T, col = custom.col,
+             heatmap_legend_param = list(
+               at = c(0,0.5, 1), labels = c("0", "0.5", "1"),
+               legend_width = unit(6, "cm"),
+               title_position = "topleft", direction = "horizontal"
+             ), use_raster = TRUE
+)
+draw(h1, heatmap_legend_side = "bottom")
+```
+
+### Smooth 0.3
+
+```{r, fig.width=4, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+#| fig-cap: Heatmaps of smoothed binding site signal with level 0.3
+
+h2 = Heatmap(m2, column_title = "Smooth 0.3", name = "Xlinks",
+             cluster_columns = F, cluster_rows = T,
+             show_row_names = FALSE,
+             show_column_names = T, border = T, col = custom.col,
+             heatmap_legend_param = list(
+               at = c(0,0.5, 1), labels = c("0", "0.5", "1"),
+               legend_width = unit(6, "cm"),
+               title_position = "topleft", direction = "horizontal"
+             ), use_raster = TRUE
+)
+draw(h2, heatmap_legend_side = "bottom")
+```
+
+### Smooth 0.4
+
+```{r, fig.width=4, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+#| fig-cap: Heatmaps of smoothed binding site signal with level 0.3
+
+h3 = Heatmap(m3, column_title = "Smooth 0.4", name = "Xlinks",
+             cluster_columns = F, cluster_rows = T,
+             show_row_names = FALSE,
+             show_column_names = T, border = T, col = custom.col,
+             heatmap_legend_param = list(
+               at = c(0,0.5, 1), labels = c("0", "0.5", "1"),
+               legend_width = unit(6, "cm"),
+               title_position = "topleft", direction = "horizontal"
+             ), use_raster = TRUE
+)
+draw(h3, heatmap_legend_side = "bottom")
+```
+
+::: 
+
+# UMAP classification of intronic binding regions
+
+UMAP classification is calculated with settings as proposed in the STOATY dive approach for coverage shape based binding site clustering. Setting details are: `n_epochs = 5000`, `n_components = 2`, `min_dist = 0.01` and `n_neighbors = 5`. 
+
+```{r}
+#| label: load umap
+#| message: false
+umapDf_par1 = readRDS("./data/umapDf_par1.rds")
+```
+
+# Density based clustering (DBSCAN) of UMAP result
+
+UMAP results are clustered with DBSCAN (density based clustering). This method defines cluster on the observed density, based on the definition of cluster centers. In particular the minimal number of points that are needed to form a cluster and the distance that points need to have to be assigned to a cluster. The following settings were used: `eps = 0.3` and `MinPts = 150`. 
+
+## DBSCAN results
+
+::: {.panel-tabset}
+
+### K Distances
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: K nearest neighbors plot with k 150. K equals the MinPts option in the dbscan. Line at 0.3 represents eps param.
+set.seed(1234)
+dbscan::kNNdistplot(umapDf_par1$layout, k = 150)
+abline(h = 0.3, lty = 2)
+```
+
+### Cleand clusters
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: DBSCAN clustering of UMAP transformation for regions with smooting 0.2 and dbscan clustering; Outlier cluster 0 removed.
+grouping = dbscan::dbscan(umapDf_par1$layout, eps = 0.3, minPts = 150)
+grouping$cluster = ifelse(grouping$cluster == 2, 3, ifelse(grouping$cluster == 3, 2, grouping$cluster))
+
+df1 = data.frame(x = umapDf_par1$layout[,1],
+                y = umapDf_par1$layout[,2],
+                group = factor(grouping$cluster))
+
+df1 = subset(df1, group != 0)
+
+ggplot(df1, aes(x, y)) +
+  ggrastr::rasterise(geom_pointdensity(size = 0.2), dpi = 300) +
+  theme_pub() +
+  scale_color_viridis(option = "A") +
+  theme(legend.position = "top",  aspect.ratio = 1) +
+  ggforce::geom_mark_ellipse(aes(label = group, group = group), alpha = 0, label.fontsize = 12, expand = unit(2, "mm")) +
+  guides(color = guide_colorbar(title.position = 'top', title.hjust = 0.5,
+                                barwidth = unit(20, 'lines'), barheight = unit(.5, 'lines'))) +
+  scale_y_continuous(limits = c(-12, 20)) +
+  scale_x_continuous(limits = c(-12, 8)) +
+  labs(
+    x = "UMAP 1",
+    y = "UMAP 2",
+  )
+```
+
+:::
+
+## Cluster examples as heatmap
+
+```{r,fig.width=6, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 6
+#| fig-height: 4
+#| fig-cap: moothed crosslink heatmaps split by kmeans clustering. Subsetted to top (head) 300.
+set.seed(1234)
+
+s = split.data.frame(smoothMM_par1, grouping$cluster)
+# s$rest = rbind(s$`1`, s$`2`, s$`3`)
+s = lapply(s, head, n = 300)
+
+custom.col = viridis(10, option = "G", direction = -1)
+clustRow = FALSE
+
+# annotate with top col sums profile m1
+df1 = data.frame(sums = colMeans(s$`1`))
+haMeans1 = HeatmapAnnotation(cov = anno_barplot(df1, gp = gpar(fill = "#595959", col = "#595959")),
+                            height = unit(2, "cm"), show_annotation_name = F)
+# annotate with top col sums profile m2 
+df2 = data.frame(sums = colMeans(s$`2`))
+haMeans2 = HeatmapAnnotation(cov = anno_barplot(df2, gp = gpar(fill = "#595959", col = "#595959")),
+                            height = unit(2, "cm"), show_annotation_name = F)
+# annotate with top col sums profile m3
+df3 = data.frame(sums = colMeans(s$`3`))
+haMeans3 = HeatmapAnnotation(cov = anno_barplot(df3, gp = gpar(fill = "#595959", col = "#595959")),
+                            height = unit(2, "cm"), show_annotation_name = F)
+
+h1 = Heatmap(s$`1`, column_title = "Cluster 1", name = "Xlinks",
+             cluster_rows = clustRow, cluster_columns = F, show_row_names = FALSE,
+             show_column_names = T, border = T, col = custom.col,
+             top_annotation = haMeans1,
+             heatmap_legend_param = list(
+               at = c(0,0.5, 1), labels = c("0", "0.5", "1"),
+               legend_width = unit(6, "cm"),
+               title_position = "topleft", direction = "horizontal"
+             ), use_raster = TRUE
+)
+h2 = Heatmap(s$`2`, column_title = "Cluster 2", name = "Xlinks",
+        cluster_rows = clustRow, cluster_columns = F, show_row_names = FALSE,
+        top_annotation = haMeans2,
+        show_column_names = T, border = T, col = custom.col, use_raster = TRUE
+)
+h3 = Heatmap(s$`3`, column_title = "Cluster 3", name = "Xlinks",
+        cluster_rows = clustRow, cluster_columns = F, show_row_names = FALSE,
+        top_annotation = haMeans3,
+        show_column_names = T, border = T, col = custom.col, use_raster = TRUE
+)
+
+l = h1 + h2 + h3
+draw(l, heatmap_legend_side = "bottom")
+```
+
+```{r}
+#| label: export clustering
+#| message: false
+mcols(rngSel)$MajorCluster = grouping$cluster
+rngExport = rngSel
+names(rngExport) = ifelse(rngExport$MajorCluster == 1, paste0("SinglePeak_", names(rngExport)),
+                          ifelse(rngExport$MajorCluster == 2, paste0("DoubleNarrow_", names(rngExport)),
+                                 ifelse(rngExport$MajorCluster == 3, paste0("DoubleWide_", names(rngExport)), paste0("Rest_",names(rngExport)))))
+mcols(rngExport)$itemRgb = ifelse(rngExport$MajorCluster == 1, viridis(option = "G", n = 5)[2], 
+                                  ifelse(rngExport$MajorCluster == 2, viridis(option = "G", n = 5)[3],
+                                         ifelse(rngExport$MajorCluster == 3, viridis(option = "G", n = 5)[4], "Grey")))
+rtracklayer::export(rngExport, "./data/rngClassified.bed", format = "BED",
+                    trackLine = new("BasicTrackLine", name="Ranges major cluster", itemRgb = TRUE)
+                    )
+```
+
+
+# Features of the clustered groups
+
+## Explorative plots for result clusters.
+
+```{r, fig.width=10, fig.height=10}
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 10
+#| fig-cap: Number of binding sites in merged regions and clusters.} Binding site overlaps counted in merged ranges (sizes is variable here).
+s = split.data.frame(smoothMM_par1, grouping$cluster)
+df = data.frame(cluster = factor(names(s)), size = sapply(s, nrow))
+
+p0 = ggplot(df, aes(x = cluster, y = size)) +
+  geom_col() +
+  theme_pub() +
+  labs(y = "N") +
+  scale_y_log10() +
+  geom_text(aes(label = size), vjust = 1.3, color = "white") +
+  labs(
+    title = "Ranges per group",
+    x = "Cluster",
+    y = "Count"
+  )
+names(mergedRange) = 1:length(mergedRange)
+rngC1 = mergedRange[names(mergedRange) %in% rownames(s$`1`)]
+rngC2 = mergedRange[names(mergedRange) %in% rownames(s$`2`)]
+rngC3 = mergedRange[names(mergedRange) %in% rownames(s$`3`)]
+bsC1 = subsetByOverlaps(bsIntron, rngC1)
+bsC2 = subsetByOverlaps(bsIntron, rngC2)
+bsC3 = subsetByOverlaps(bsIntron, rngC3)
+
+df = data.frame(cluster = rep(c("C1", "C2", "C3"),2),
+                type = c(rep("BS",3),rep("Region",3)),
+                value = c(length(bsC1), length(bsC2), length(bsC3),
+                          length(rngC1), length(rngC2), length(rngC3))
+                )
+p1 = ggplot(df, aes(x = cluster, y = value, fill = type)) +
+  geom_col(position = "fill") +
+  theme_pub() +
+  theme(legend.position = "top") +
+  scale_fill_npg() +
+  labs(
+    x = "Cluster",
+    y = "Counts",
+    fill = "Type"
+  )
+
+p2 = ggplot(df, aes(x = cluster, y = value, fill = type)) +
+  geom_col(position = "dodge") +
+  theme_pub() +
+  theme(legend.position = "top") +
+  scale_fill_npg() +
+  labs(
+    x = "Cluster",
+    y = "Counts",
+    fill = "Type"
+  )
+
+# names(mergedRange) = 1:length(mergedRange)
+# s = split.data.frame(smoothMM_par1, grouping$cluster)
+df1 = data.frame(N = mergedRange$nBS[names(mergedRange) %in% rownames(s$`1`)], cluster = "C1")
+df2 = data.frame(N = mergedRange$nBS[names(mergedRange) %in% rownames(s$`2`)], cluster = "C2")
+df3 = data.frame(N = mergedRange$nBS[names(mergedRange) %in% rownames(s$`3`)], cluster = "C3")
+df = rbind(df1,df2,df3)
+df$N[df$N > 7] = 7
+df = table(df$N, df$cluster) %>% as.data.frame()
+
+p3 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  )
+
+p4 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "fill") +
+  # scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  )
+
+p5 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  ) +
+  facet_grid(~Var2)
+
+(p2 + p1) / (p0 + p3) / (p4 + p5)
+```
+
+```{r, fig.width=10, fig.height=10}
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 10
+#| fig-cap: Number of binding sites in merged regions and clusters. Binding site overlaps counted in 81nt clustered ranges.
+s = split.data.frame(smoothMM_par1, grouping$cluster)
+df = data.frame(cluster = factor(names(s)), size = sapply(s, nrow))
+
+p0 = ggplot(df, aes(x = cluster, y = size)) +
+  geom_col() +
+  theme_pub() +
+  labs(y = "N") +
+  scale_y_log10() +
+  geom_text(aes(label = size), vjust = 1.3, color = "white") +
+  labs(
+    title = "Ranges per group",
+    x = "Cluster",
+    y = "Count"
+  )
+rngC1 = rngSel[names(rngSel) %in% rownames(s$`1`)]
+rngC2 = rngSel[names(rngSel) %in% rownames(s$`2`)]
+rngC3 = rngSel[names(rngSel) %in% rownames(s$`3`)]
+bsC1 = subsetByOverlaps(bsIntron, rngC1)
+bsC2 = subsetByOverlaps(bsIntron, rngC2)
+bsC3 = subsetByOverlaps(bsIntron, rngC3)
+
+df = data.frame(cluster = rep(c("C1", "C2", "C3"),2),
+                type = c(rep("BS",3),rep("Region",3)),
+                value = c(length(bsC1), length(bsC2), length(bsC3),
+                          length(rngC1), length(rngC2), length(rngC3))
+                )
+p1 = ggplot(df, aes(x = cluster, y = value, fill = type)) +
+  geom_col(position = "fill") +
+  theme_pub() +
+  theme(legend.position = "top") +
+  scale_fill_npg() +
+  labs(
+    x = "Cluster",
+    y = "Counts",
+    fill = "Type"
+  )
+
+p2 = ggplot(df, aes(x = cluster, y = value, fill = type)) +
+  geom_col(position = "dodge") +
+  theme_pub() +
+  theme(legend.position = "top") +
+  scale_fill_npg() +
+  labs(
+    x = "Cluster",
+    y = "Counts",
+    fill = "Type"
+  )
+
+df1 = data.frame(N = countOverlaps(rngC1, bsIntron), cluster = "C1")
+df2 = data.frame(N = countOverlaps(rngC2, bsIntron), cluster = "C2")
+df3 = data.frame(N = countOverlaps(rngC3, bsIntron), cluster = "C3")
+df = rbind(df1,df2,df3)
+df$N[df$N > 5] = 5
+df = table(df$N, df$cluster) %>% as.data.frame()
+
+p3 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  ) +
+  geom_text(aes(label = Freq), vjust = 0.5, hjust = 1.2, position = position_dodge(width = .9), angle = 90) 
+
+p4 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "fill") +
+  # scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  ) +
+  scale_x_discrete(breaks=c("1", "2", "3", "4", "5"),
+        labels=c("1", "2", "3", "4", "5+"))
+
+p5 = ggplot(df, aes(x = Var1, y = Freq+1, fill = Var2)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Binding sites per group and cluster",
+    x = "Number of Binding sites",
+    y = "Count",
+    fill = "Cluster"
+  ) +
+  facet_grid(~Var2)
+
+(p2 + p1) / (p0 + p3) / (p4 + p5)
+```
+
+## Binding sites per cluster selection
+
+::: {.panel-tabset}
+
+### V1
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Binding sites per cluster.
+df2 = df
+df2$Var1 = ifelse(df2$Var1 == 5, "5+", df$Var1)
+
+p1 = ggplot(df2, aes(x = Var2, y = Freq+1, fill = Var1)) +
+  geom_col(position = "fill") +
+  theme_pub() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Number of binding sites per cluster",
+    x = "Cluster",
+    y = "Fraction",
+    fill = "Binding sites"
+  ) +
+  theme(aspect.ratio = 1)
+p1
+```
+
+### V2
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Binding sites per cluster.
+p2 = ggplot(df2, aes(x = Var2, y = Freq+1, fill = Var1)) +
+  geom_col(position = "fill") +
+  theme_pub() +
+  scale_fill_grey() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Number of binding sites per cluster",
+    x = "Cluster",
+    y = "Fraction",
+    fill = "Binding sites"
+  ) +
+  theme(aspect.ratio = 1)
+p2
+```
+
+### V3
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Binding sites per cluster.
+p3 = ggplot(df2, aes(x = Var2, y = Freq+1, fill = Var1)) +
+  geom_col(position = "fill") +
+  theme_pub() +
+  scale_fill_brewer(palette = 1, direction = 1) +
+  theme(legend.position = "top") +
+  labs(
+    title = "Number of binding sites per cluster",
+    x = "Cluster",
+    y = "Fraction",
+    fill = "Binding sites"
+  ) +
+  theme(aspect.ratio = 1)
+p3
+```
+
+:::
+
+```{r}
+#| label: make table
+#| message: false
+df1 = data.frame(N = countOverlaps(rngC1, bsIntron), cluster = "C1")
+df2 = data.frame(N = countOverlaps(rngC2, bsIntron), cluster = "C2")
+df3 = data.frame(N = countOverlaps(rngC3, bsIntron), cluster = "C3")
+df = rbind(df1,df2,df3)
+
+d = df %>% group_by(cluster) %>% summarize(mean = mean(N), median = median(N)) %>% as.data.frame()
+
+kable(d, caption = "Number of BS per cluster") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+
+## Distance to splice site per cluster
+
+```{r}
+#| label: load gene annotation
+#| message: false
+load("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.rda")
+anno.db = loadDb("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.sqlite")
+gns = genes(anno.db)
+idx = match(gns$gene_id, anno$gene_id)
+elementMetadata(gns) = cbind(elementMetadata(gns), elementMetadata(anno)[idx,])
+```
+
+```{r}
+#| label: calculate distances
+#| message: false
+x0 = subset(anno, transcript_type == "protein_coding")
+x1 = subset(x0, type == "exon" | type == "CDS")
+x2 = subset(x1, tag == "exp_conf" | tag == "CCDS" | tag == "basic")
+
+exn = exons(anno.db)
+exn = subsetByOverlaps(exn, x2, type = "within")
+export(granges(exn), "./data/exn.bed", format = "BED")
+
+spliceSites3 = unique(resize(exn, fix = "start", width = 1)) 
+spliceSites5 = unique(resize(exn, fix = "end", width = 1)) 
+
+calcDist <- function(rng) {
+  # identify the next downstream 3'SS for each given range
+  idx3 = precede(rng, spliceSites3)
+  # identify the next downstream 3'SS for each given range
+  idx5 = follow(rng, spliceSites5)
+  
+  if (any(is.na(idx3), is.na(idx5))) {
+    removeIdx3 = which(is.na(idx3))
+    removeIdx5 = which(is.na(idx5))
+    removeIdx = c(removeIdx3, removeIdx5)
+    idx3 = idx3[-removeIdx]
+    idx5 = idx5[-removeIdx]
+    rng = rng[-removeIdx]
+  }
+  
+  # calculate distance between given range and associated splice site
+  d1 = distance(rng, spliceSites3[idx3])
+  d2 = distance(rng, spliceSites5[idx5])
+  
+  df = data.frame(d3ss = d1, d5ss = d2)
+  return(df)
+}
+
+```
+
+::: {.panel-tabset}
+
+### Distance
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distances to splice sites. Distance is calculated from the outer edge of the outer binding sites for each region to the respective 3'ss and 5'ss splice site"
+s = split.data.frame(smoothMM_par1, grouping$cluster)
+originalRange = mergedRange
+originalRange = granges(originalRange)
+names(originalRange) = names(rngSel)
+rngC1 = originalRange[names(originalRange) %in% rownames(s$`1`)]
+rngC2 = originalRange[names(originalRange) %in% rownames(s$`2`)]
+rngC3 = originalRange[names(originalRange) %in% rownames(s$`3`)]
+
+# calculate distance
+df1 = calcDist(rngC1) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C1: single") %>%
+    pivot_longer(-clust)
+
+df2 = calcDist(rngC2) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C2: double-narrow") %>%
+    pivot_longer(-clust)
+
+df3 = calcDist(rngC3) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C3: double-wide") %>%
+    pivot_longer(-clust)
+
+df = rbind(df1,df2,df3)
+df$value[df$value == 0] = 1
+
+p1 = ggplot(df, aes(x = clust, y = log10(value), fill = name)) +
+    geom_boxplot(outlier.shape = NA) +
+    theme_pub() +
+    scale_fill_npg() +
+    labs(
+        x = "Cluster",
+        y = "Distance to splice site (log10)",
+        fill = "Splice site"
+    )
+p1
+```
+
+### Distance ratio
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distances to splice sites. Distance is calculated from the outer edge of the outer binding sites for each region to the respective 3'ss and 5'ss splice site"
+df1 = calcDist(rngC1) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C1: single", r = d3ss/ d5ss) 
+
+df2 = calcDist(rngC2) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C2: double-narrow", r = d3ss/ d5ss) 
+
+df3 = calcDist(rngC3) %>% 
+    as.data.frame() %>%
+    mutate(clust = "C3: double-wide", r = d3ss/ d5ss) 
+
+df = rbind(df1,df2,df3)
+
+p2 = ggplot(df, aes(x = clust, y = log2(r), fill = clust)) +
+    geom_boxplot(outlier.shape = NA) +
+    theme_pub() +
+    scale_fill_manual(values = viridis(n = 10, option = "mako")[c(3,5,7)]) +
+    theme(legend.position = "none") +
+    labs(
+        x = "Cluster",
+        y = "Splice site distance ratio (log2(3'ss/5'ss))"
+    )
+p2
+```
+
+:::
+
+
+# UMAP subclassification of major cluster 3 - double-wide pattern
+
+To further refine the positioning of double-peaks within the cluster 3 groups, we performed a second round of UMAP + DBSCAN. After cleaning resulting clusters each cluster gets assigned to a group based on the distance of the modes between both double-peaks.
+
+```{r}
+#| label: smooth subcluster 3
+#| message: false
+selMM_g3 = masterMM[grouping$cluster == 3,]
+
+normMM_g3 = apply(selMM_g3, 1, function(x){
+  n = ((x - min(x)) / (max(x) - min(x)))
+  return(n)
+})
+normMM_g3 = t(normMM_g3)
+
+smoothMM_g3_par1 <- t(apply(normMM_g3, 1, smoothing, lambda=0.1, dim=500))
+saveRDS(smoothMM_g3_par1, "./data/smoothMM_g3_par1.rds")
+```
+
+```{r}
+#| label: load umap for subcluster 3
+#| message: false
+umapDf_g3_par1 = readRDS("./data/umapDf_g3_par1.rds")
+```
+
+
+## DBSCAN clustering results
+
+::: {.panel-tabset}
+
+### K Distances
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: K nearest neighbors plot with k 150. K equals the MinPts option in the dbscan. Line at 0.3 represents eps param.
+set.seed(1234)
+dbscan::kNNdistplot(umapDf_g3_par1$layout, k = 60)
+abline(h = 0.22, lty = 2)
+```
+
+### Cleand clusters
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: DBSCAN clustering of UMAP transformation for regions with smooting 0.2 and dbscan clustering; Outlier cluster 0 removed.
+groupingG3 = dbscan::dbscan(umapDf_g3_par1$layout, eps = 0.23, MinPts = 60)
+
+df1 = data.frame(x = umapDf_g3_par1$layout[,1],
+                y = umapDf_g3_par1$layout[,2],
+                group = factor(groupingG3$cluster))
+
+df1 = df1 %>% subset(group != "0")
+p3 = ggplot(df1, aes(x, y, color = group)) +
+  # geom_point(size = 0.2) +
+  ggrastr::geom_point_rast(size = 0.2) +
+  theme_pub() +
+  # scale_color_manual(values = viridis(n = 6, option = "mako")[2:8]) +
+  guides(colour = guide_legend(override.aes = list(size=2), nrow = 4)) +
+  theme(legend.position = "none") +
+  labs(title = "Smooth 0.1", 
+       color = "C")
+
+p3
+```
+
+:::
+
+
+## Order cluster groups by peak mode distance
+
+::: {.panel-tabset}
+
+### Scatter
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Sub-cluster 3 groups matched by double peak mode distances
+
+set.seed(1234)
+
+# split smoothed coverage matrix by clustering groups
+s = split.data.frame(smoothMM_g3_par1, groupingG3$cluster)
+tmp = lapply(1:length(s), function(x){
+    z = floor(ncol(s[[1]]) / 2)
+    d = data.frame(Group = factor(rep(x, ncol(s[[x]]))),
+                   value = colMeans(s[[x]], na.rm = TRUE),
+                   pos = -246:247)
+    
+})
+df = dplyr::bind_rows(tmp, .id = "variable")
+df$Group = as.factor(as.numeric(df$Group)-1)
+
+# calc new position
+dimOrg = 81
+dimSmooth = 500
+dimSf = dimSmooth / dimOrg
+df$newPos = df$pos / dimSf
+
+# split by group
+df = df[df$Group != 0,]
+dfSplit = split(df, df$Group)
+dfSplit = lapply(dfSplit, function(x){
+    data.frame(v = rep(x$newPos, ifelse(x$value < 0, x$value*(-1000), x$value*1000)))
+})
+dfSplit = dplyr::bind_rows(dfSplit, .id = "variable")
+dfSplit = dfSplit[dfSplit$variable != 0,]
+
+# calculate modes
+modeDf = split.data.frame(dfSplit, dfSplit$variable)
+modes = lapply(modeDf, function(x){
+    m = locmodes(x$v, mod0 = 2)
+    d = m$locations
+    return(d)
+})
+modes = dplyr::bind_rows(modes, .id = "variable") %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column("cluster") %>% 
+    rename(mode1 = V1, mode2 = V3, antimode = V2)
+
+dfLine = modes %>%
+    select(cluster, mode1, mode2) %>%
+    pivot_longer(-cluster) %>%
+    rename(variable = cluster)
+
+dist = length(modes$mode1:modes$mode2)
+
+dfDist = modes %>%
+    group_by(cluster) %>%
+    mutate(dist = length(mode1:mode2)) %>%
+    select(cluster, dist) %>%
+    rename(variable = cluster)
+
+fOrder = dfDist$variable[order(dfDist$dist)]
+dfSplit$variable = factor(dfSplit$variable, levels = fOrder)
+dfLine$variable = factor(dfLine$variable, levels = fOrder)
+dfDist$variable = factor(dfDist$variable, levels = fOrder)
+
+dfOrder = dfDist[order(dfDist$dist),]
+dfOrder$NewCluster = 1:nrow(dfOrder)
+
+idx = match(df1$group, dfOrder$variable)
+df1$NewCluster = as.factor(dfOrder$NewCluster[idx])
+
+ggplot(subset(df1, NewCluster != 0), aes(x, y, fill = NewCluster)) +
+    rasterize(geom_point(shape = 21, stroke = 0.3), dpi = 300) +
+    theme_pub() +
+    scale_fill_viridis(option = "turbo", discrete = T, direction = -1) +
+    theme(legend.position = "none", aspect.ratio = 1) +
+    scale_y_continuous(limits = c(-10, 10)) + 
+    scale_x_continuous(limits = c(-10, 15)) +
+    labs(
+        x = "UMAP 1",
+        y = "UMAP 2",
+    ) +
+    ggforce::geom_mark_ellipse(aes(label = NewCluster, group = NewCluster),
+                               alpha = 0, label.fontsize = 12,
+                               label.buffer = unit(5, 'mm'), expand = unit(2, "mm"),
+                               label.minwidth = unit(5, "mm")) 
+```
+
+### Coverage
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Sub-cluster 3 smoothed crosslink densities split by density based clustering.} Sorted by double-mode distances.
+df = dfSplit
+
+dfOrder = dfDist[order(dfDist$dist),]
+dfOrder$NewCluster = 1:nrow(dfOrder)
+
+idx = match(df$variable, dfOrder$variable)
+df$NewCluster = dfOrder$NewCluster[idx]
+df$name = paste0("cluster: ", df$NewCluster, ", distance: ", dfOrder$dist[idx])
+
+df$name = factor(df$name)
+df$name = factor(df$name, levels = as.character(unique(df$name)[as.numeric(levels(df$variable))]))
+
+p = ggplot(df, aes(x = v, y = name, fill = ..density..)) +
+  rasterise(geom_density_ridges_gradient(scale = 10, bandwidth = 0.1, color = "black", size = 0.5),dpi = 300) +
+  # theme_pub() +
+  theme_pub() +
+  theme(legend.position = "top") +
+  scale_y_discrete(expand = expand_scale(mult = c(0, 0.15))) +
+  scale_fill_gradient2(position="top" , low = "white", high = "#366A9FFF", mid = "348AA6FF", midpoint = 0.05, breaks = c(0.01, 0.05, 0.1)) +
+  labs(
+    title = "Sub-cluster by double-mode distance",
+    x = "Relative distance (nt)",
+    y = "Cluster"
+  )
+p
+```
+
+:::
+
+
+# Session Information
+
+```{r, session_info, include=TRUE, echo=TRUE, results='markup'}
+sessionInfo()
+```
+

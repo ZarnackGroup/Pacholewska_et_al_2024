@@ -1,0 +1,995 @@
+---
+title: "SF3B1 iCLIP analysis"
+subtitle: "Binding site definition"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+author: 
+ - name: "Dr. Mirko Brueggemann"
+   email: mirko.brueggemann@bmls.de
+   affiliations:
+      - name: Buchman Institute for Molecular Life Sciences
+format: 
+    html:
+        theme: sandstone
+        code-fold: TRUE
+        code-overflow: scroll
+        code-summary: "Show code"
+        code-tools: TRUE
+        toc: TRUE
+        toc-depth: 3
+        toc-location: left
+        number-sections: TRUE
+        self-contained: TRUE
+        fontsize: 11pt
+crossref: 
+    fig-title: '**Figure**'
+    fig-labels: arabic
+    title-delim: "**.**"
+code-block-bg: "#EEEEEE"
+editor: 
+    markdown: 
+      wrap: 120
+---
+
+# Analysis Description
+
+This report holds all analysis and plots for xxx
+
+
+This report shows downstream processing of computed binding sites for the *imb_koenig_2016_13_03* dataset. All replicates (3 wt and 2 mut) were down-sampled to the the counts in the lowest mutant replicate and merged for peak calling with PureCLIP. Processed samples are:
+
+-   imb_koenig_2016_13_03_wt_2
+-   imb_koenig_2016_13_03_wt_3
+-   imb_koenig_2016_13_03_wt_4
+-   imb_koenig_2016_13_03_mut_1
+-   imb_koenig_2016_13_03_mut_3 (downsample seed)
+
+## Load libraries
+
+```{r}
+#| label: libraries
+#| message: false
+library(rtracklayer)
+library(GenomicRanges)
+library(ggplot2)
+library(AnnotationDbi)
+library(dplyr)
+library(reshape2)
+library(UpSetR)
+library(GenomicFeatures)
+library(kableExtra)
+library(knitr)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(viridis)
+library(BindingSiteFinder)
+library(ComplexHeatmap)
+library(forcats)
+library(ggtext)
+library(patchwork)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(ggpointdensity)
+library(ggsci)
+library(ggsci)
+library(ggtext)
+library(waffle)
+library(ggrepel)
+library(patchwork)
+```
+
+```{r}
+#| label: load additional scripts
+#| message: false
+source("../styles.R")
+source("../helper.R")
+```
+
+
+# Library downsampling
+
+Due to sequencing depth and library complexity variations, we decided to initially down-sample all replicates to the sample with the overall lowest number of reads (MUT 2). All downstream analysis are performed on the down-sampled data, removing the need of any additional library size normalization.
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Downsampling of iCLIP samples to the samples with the lowest number of crosslinks.
+df = data.frame(
+  sample = c("mut1", "mut2", "wt1", "wt2", "wt3"),
+  before = c(19005395, 13892358, 28711869, 20679517, 30222832),
+  after =  c(13874238, 13892358, 13780540, 13857030, 13605493)
+) %>% pivot_longer(-sample)
+
+ggplot(df, aes(x = sample, y = value, fill = name)) +
+  geom_col(position = "dodge") +
+  theme_nice() +
+  coord_flip() +
+  scale_fill_npg() +
+  theme(legend.position = "top") +
+  labs(
+    title = "iCLIP downsampling",
+    x = "Sample",
+    y = "Number of reads",
+    fill = "Downsampling"
+  ) + 
+    geom_text(aes(label = myFormat(value)), position = position_dodge(width = 0.8), angle = 45, size = 2)
+```
+
+
+# Gene Annotation
+
+Annotations are downloaded from GENCODE v36 (Release 36 (GRCh38)). Annotations are then filtered by feature and transcript annotation level.
+
+-   Feature annotation
+
+    -   keep level 1 and 2
+    -   remove level 3
+
+-   Gencode definition
+
+    -   1 = verified loci, 2 = manually annotated loci,3 = automatically annotated loci
+
+-   Transcript level annotation
+
+    -   keep level 1,2 and 3
+    -   remove level 4,5 and NA
+
+-   Gencode definition
+
+    -   1 (all splice junctions of the transcript are supported by at least one non-suspect mRNA),
+    -   2 (the best supporting mRNA is flagged as suspect or the support is from multiple ESTs),
+    -   3 (the only support is from a single EST),
+    -   4 (the best supporting EST is flagged as suspect),
+    -   5 (no single transcript supports the model structure),
+    -   NA (the transcript was not analyzed)
+    
+
+```{r}
+#| label: load gene annotation
+#| message: false
+load("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.rda")
+anno.db = loadDb("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.sqlite")
+gns = genes(anno.db)
+idx = match(gns$gene_id, anno$gene_id)
+elementMetadata(gns) = cbind(elementMetadata(gns), elementMetadata(anno)[idx,])
+```
+
+
+# Preprocess pureCLIP output
+
+Initially peaks are called using PureCLIP as described in the methods section. Here we pre-filter all PureCLIP called crosslink sites to keep only the most informative proportion. 
+
+```{r}
+#| label: load pureclip output
+#| message: false
+peaksInitial = "/Users/mirko/Projects/sf3b1/01_data_subsamp/combined/pureCLIP/PureCLIP.crosslink_sites_mod.bed"
+peaksInitial = import(con = peaksInitial, format = "BED")
+```
+
+
+## Gloabal crosslink site filtering
+
+PureClip called crosslink sites are filtered on a global level, removing sites with the lowest 5% PureCLIP score. This essentially removes crosslink sites that are only barely enriched above the local background. These sites likely contribute more noise to the data rather then enhancing the spectrum of detected sites to lowly abundant transcripts, since they are present uniformly across almost all transcripts.
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distribution of the pureCLIP score. The red line indicates the 95% threshold used to keep only strong signal sites.
+
+df = data.frame(score = peaksInitial$score)
+quantileCutoffpureClipScore = quantile(df$score, probs = seq(0,1, by = 0.05))
+peaksFiltered = peaksInitial[peaksInitial$score >= quantileCutoffpureClipScore[2]]
+
+df$group = ifelse(df$score > quantileCutoffpureClipScore[2], ">5%", "<5%")
+ggplot(df, aes(x = log2(score), fill = group)) + 
+    geom_histogram(bins = 500) +
+    geom_vline(xintercept = log2(quantileCutoffpureClipScore[2]), color = "darkgrey") + 
+    labs(
+        title = "PureCLIP score distribution",
+        x = "PureCLIP score [log2]", 
+        y = "Count"
+    ) + 
+    theme_pub() +
+    theme(legend.position = "top")
+```
+
+
+## Gene-level crosslink site filtering
+
+To enrich for the strongest crosslinking pattern only the 20% highest crosslink sites within each transcript were retained for further analysis. This filter is very restrictive, removing a large proportion of the data. It is beneficial for detecting the strongest binding pattern presented in the data. 
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: PureCLIP score local filter. Only the top 20% sites per gene are kept.
+peaksFilteredPerGene = filterByRegion(gns, peaksFiltered, keepAbove = 0.8)
+
+df1 = data.frame(score = peaksFiltered$score, group = "global filter")
+df2 = data.frame(score = peaksFilteredPerGene$score, group = "top 20% per gene")
+df = rbind(df1,df2)
+
+ggplot(df, aes(x = log2(score), fill = group)) + 
+    geom_histogram(bins = 500) +
+    xlab("PureCLIP score [log2]") +
+    ylab("Count") +
+    ggtitle("pureCLIP score distribution") +
+    theme_pub() +
+    theme(legend.position = "top")
+```
+
+
+
+# Merge crosslink sites into binding sites
+
+All crosslinks site retained after the above filtering steps are subjected to the iterative binding site resizing routine.
+
+```{r}
+#| label: load iCLIP data
+#| message: false
+clipFilesWt = "/Users/mirko/Projects/sf3b1/01_data_subsamp/wt/cov/replicate"
+clipFilesMut = "/Users/mirko/Projects/sf3b1/01_data_subsamp/mut/cov/replicate"
+clipFiles = c(clipFilesWt, clipFilesMut)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "Plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "Minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = c(1:5),
+  condition = factor(c("MUT", "MUT", "WT", "WT", "WT"), levels = c("MUT", "WT")),
+                     clPlus = clipFilesP,
+                     clMinus = clipFilesM)
+# Make BindingSiteFinder object
+bds = BSFDataSetFromBigWig(ranges = peaksFilteredPerGene, meta = colData)
+```
+
+
+## Binding site width selection
+
+The optimal binding site width is determined by the binding site signal to noise ratio as described in the methods section.
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Signal to noise ratio of crosslink events per binding site width. Binding sites are calculated based on the indicated width. The ratio of crosslink events residing within binding sites compared to the sum of crosslink events directly neighbouring the binding site on both sides is computed.
+
+supportRatioPlot(bds,
+                 bsWidths = seq(from = 3, to = 29, by = 2),
+                 sub.chr = "chr1", minWidth = 2,
+                 minClSites = 1, minCrosslinks = 2)
+```
+
+```{r, fig.width=10, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 6
+#| fig-cap: Crosslink profiles of different binding site width options. Binding site and signal are subsetted to chr1.
+
+bds1 <- makeBindingSites(object = bds, bsSize = 3, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+bds2 <- makeBindingSites(object = bds, bsSize = 5, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+bds3 <- makeBindingSites(object = bds, bsSize = 7, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+bds4 <- makeBindingSites(object = bds, bsSize = 9, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+bds5 <- makeBindingSites(object = bds, bsSize = 15, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+bds6 <- makeBindingSites(object = bds, bsSize = 17, minWidth = 1,
+                              minCrosslinks = 2, minClSites = 1, sub.chr = "chr1")
+
+l = list(`1. bsSize = 3` = bds1, `2. bsSize = 5` = bds2, `3. bsSize = 7` = bds3,
+         `4. bsSize = 9` = bds4, `5. bsSize = 15` = bds5, `6. bsSize = 17` = bds6)
+
+rangeCoveragePlot(l, width = 30) 
+```
+
+
+## Compute binding sites
+
+```{r}
+#| label: set binding site size
+#| message: false
+bsSize_Final = 5
+minWidth_Final = 2
+minCrosslinks_Final = 2
+minClSites_Final = 1
+```
+
+Here we use the estimated settings from above to compute equally sized binding site from all input crosslink sites.
+
+-   bsSize = `r bsSize_Final`
+-   minWidth = `r minWidth_Final`
+-   minCrosslinks = `r minCrosslinks_Final`
+-   minClSites = `r minClSites_Final`
+
+
+```{r}
+#| label: binding site merging
+#| message: false
+bdsMerge <- makeBindingSites(object = bds, bsSize = bsSize_Final, minWidth = minWidth_Final,
+                        minCrosslinks = minCrosslinks_Final, minClSites = minClSites_Final)
+
+peaksProcessed = getRanges(bdsMerge)
+
+df = getSummary(bdsMerge)
+df = format(df, big.mark = ",", decimal.mark = ".")
+kable(df, caption = "Merge and combine") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Details of the binding site merging.
+
+makeBsSummaryPlot(bdsMerge) +
+    scale_x_discrete(guide = guide_axis(n.dodge = 2))
+```
+
+
+
+# Replicate reproducibility
+
+Since the initially used crosslink sites are computed from the merged signal of all replicates, binding sites resulting from the previous merge might not be reproducible among all replicates. For that reason, we specifically check which of the computed binding sites are reproduced by the individual replicates.
+
+All crosslink events within each binding site are summed up per replicate. The individual threshold for each replicate is set to the 5% quantile of the crosslink distribution. To account for low cross-link replicates, a lower boundary of a minimum of 2 crosslink events per binding site is enforced. For each binding site all replicate from each condition must meet the defined threshold. 
+
+```{r}
+#| label: reproducibility filtering
+#| message: false
+bdsMerge = reproducibilityFilter(bdsMerge, cutoff = c(0.05, 0.05), minCrosslinks = 2, nReps = c(2,3))
+```
+
+
+::: {.panel-tabset}
+
+### Replicate-specific threshold
+
+```{r, fig.width=8, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Distribution of summed up crosslinks for each replicate. The count threshold for each repliacte is indicated by a grey line (5% quantile).
+reproducibilityFilterPlot(bdsMerge)
+```
+
+### Overall threshold application
+
+```{r, fig.width=8, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Overview of binding sites that are shared between replicates. A binding site is reproducible if supported by 2 replicates from the MUT or 3 replicates from the WT condition.
+reproducibilitySamplesPlot(bdsMerge)
+```
+
+### Pairwise reproducibility
+
+```{r, fig.width=6, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Pairwise crosslink correlation among replicates of both conditions after reproducibility filtering.
+reproducibilityScatterPlot(bdsMerge)
+```
+
+:::
+
+
+# Genomic target identification
+
+A major question the follow from binding site definition is the assessment of the genomic targets that SF3B1 binds to. In the following section we first assign computed binding sites to target genes and then place those that match protein coding genes on annotated transcript regions.
+
+## Target gene identification
+
+```{r}
+#| label: gene assignment rule
+#| message: false
+selectTerms = c("protein_coding", "tRNA", "lincRNA", "snRNA")
+rule = unique(gns$gene_type)
+rule = rule[!rule %in% selectTerms]
+rule = c(selectTerms, rule)
+```
+
+```{r}
+#| label: assign to genes
+#| message: false
+peaksReproducible = getRanges(bdsMerge)
+targets = subsetByOverlaps(gns, peaksReproducible)
+df = findOverlaps(targets, peaksReproducible) %>% as.data.frame()
+
+# split into easy and complex cases
+idxDouble = df[duplicated(df$subjectHits),]
+idxSingle = df[!duplicated(df$subjectHits),]
+
+# handle single overlap cases
+peaksRepoSingle = peaksReproducible[idxSingle$subjectHits]
+mcols(peaksRepoSingle)$geneType = targets$gene_type[idxSingle$queryHits]
+mcols(peaksRepoSingle)$geneName = targets$gene_name[idxSingle$queryHits]
+mcols(peaksRepoSingle)$geneID = targets$gene_id[idxSingle$queryHits]
+
+# handle multi overlap cases
+peaksRepoDouble = peaksReproducible[idxDouble$subjectHits]
+
+peaksRepoDoubleCleaned = as(lapply(seq_along(peaksRepoDouble), function(x){
+  currPeak = peaksRepoDouble[x]
+  currTargets = subsetByOverlaps(targets, currPeak)
+  nOverlaps = length(currTargets)
+  # 1) take gene type as first criterion
+  # -> prefer the type that is first in the `rule` list
+  solution = unique(match(currTargets$gene_type, rule))
+  nSolutions = length(solution)
+  
+  if (nSolutions == nOverlaps) {
+    # solution successfull
+    mcols(currPeak)$geneType = currTargets$gene_type[min(solution)]
+    mcols(currPeak)$geneName = currTargets$gene_name[min(solution)]
+    mcols(currPeak)$geneID = currTargets$gene_id[min(solution)]
+  }
+  if (nSolutions < nOverlaps) {
+    # no solution found 
+    # -> Stop and return NA
+    mcols(currPeak)$geneType = NA
+    mcols(currPeak)$geneName = NA
+    mcols(currPeak)$geneID = NA
+  }
+  return(currPeak)
+}),"GRangesList")
+peaksRepoDoubleCleaned = unlist(peaksRepoDoubleCleaned)
+peaksRepoDoubleCleaned = peaksRepoDoubleCleaned[!is.na(peaksRepoDoubleCleaned$geneID)]
+
+# assign peaks
+bsGene = c(peaksRepoSingle, peaksRepoDoubleCleaned)
+bsGene = sortSeqlevels(bsGene)
+bsGene = sort(bsGene)
+bsGene = unique(bsGene)
+
+# assign targets
+targetsGene = targets[targets$gene_id %in% bsGene$geneID]
+```
+
+Here we match binding sites with their hosting genes. Due to the degree of overlapping gene loci in the annotation some binding sites can not be unabigously mapped to a hosting gene. To recover these cases we implement a strategy that first looks for the most frequent gene annotations among overlapping cases and if these yield a tie assignment is followed by the hierarchical order: `r rule`.
+
+::: {.panel-tabset}
+
+### Gene overlaps
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Pairwise crosslink correlation among replicates of both conditions after reproducibility filtering.
+
+# # count overlaps per peak and gene
+df = findOverlaps(targets, peaksReproducible) %>% as.data.frame()
+df$geneType = targets$gene_type[df$queryHits]
+df = df %>% 
+  group_by(subjectHits) %>% 
+  summarise(olType = paste0(length(geneType), " annotations overlapping")) %>%
+  dplyr::select(olType) %>%
+  as.data.frame()
+
+df = basicVectorToNiceDf(df)
+# make plot
+ggplot(df, aes(x = Type, y = Freq, fill = Type, label = labelNice)) +
+    geom_col(color = "black") +
+    geom_text(data = df, aes(x = Type, y = 0), size = 4, color = "grey", hjust = -.3) +
+    scale_y_log10() +
+    coord_flip(clip = "on", expand = TRUE) +
+    theme_pub() +
+    scale_fill_viridis(discrete = TRUE, direction = -1, option = "B") +
+    theme(legend.position = "none") +
+    labs(
+        title = "Binding sites overlapping multiple annotations",
+        x = "",
+        y = "Count")
+# NOTE to this plot:
+# -> shows how much the rule/ hierarchy affects the BS to gene assignment
+# ---> many overlaps >1 means many BS will be assigned to their host gene by our rule
+# -> overlaps can result in genes with different types, or genes with multiple types
+```
+
+### Targets - BS
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Overlap resolved binding spectrum for binding sites summarized in the top 3 most frequent gene types.
+df1 = data.frame(GeneType = (bsGene$geneType), type = "Peak") %>%
+    mutate(GeneType = ifelse(grepl("pseudogene", GeneType), "pseudogene", GeneType)) %>%
+    table() %>%
+    as.data.frame() %>%
+    mutate(label = paste0(format(Freq, big.mark = ",", decimal.mark = "."),
+                          " (", format(round((Freq / sum(Freq))*100, digits = 2),
+                                       big.mark = ",", decimal.mark = "."),")")) %>%
+    mutate(GeneType = factor(GeneType, levels = c(GeneType[order(Freq)])))
+
+ggplot(df1, aes(x = GeneType, y = Freq, fill = GeneType, label = label)) +
+    geom_col(color = "black") +
+    geom_text(aes(y = 0 ), size = 4, color = "grey", hjust = -.3) +
+    scale_y_log10() +
+    coord_flip(clip = "on", expand = TRUE) +
+    scale_fill_npg() +
+    theme_pub() +
+    theme(legend.position = "none") +
+    labs(title = "Binding spectrum - peaks",
+         y = "Count",
+         x = "Gene type") 
+```
+
+### Targets - genes
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Overlap resolved binding spectrum for target genes summarized in the top 3 most frequent gene types.
+df2 = data.frame(GeneType = (targetsGene$gene_type), type = "Targets") %>%
+    mutate(GeneType = ifelse(grepl("pseudogene", GeneType), "pseudogene", GeneType)) %>%
+    table() %>%
+    as.data.frame() %>%
+    mutate(label = paste0(format(Freq, big.mark = ",", decimal.mark = "."),
+                          " (", format(round((Freq / sum(Freq))*100, digits = 2),
+                                       big.mark = ",", decimal.mark = "."),")")) %>%
+    mutate(GeneType = factor(GeneType, levels = c(GeneType[order(Freq)])))
+
+ggplot(df2, aes(x = GeneType, y = Freq, fill = GeneType, label = label)) +
+  geom_col(color = "black") +
+  geom_text(aes(y = 0 ), size = 4, color = "grey", hjust = -.3) +
+  scale_y_log10() +
+  coord_flip(clip = "on", expand = TRUE) +
+  scale_fill_npg() +
+  theme_pub() +
+  theme(legend.position = "none") +
+  labs(title = "Binding spectrum - targets",
+       y = "Count",
+       x = "Gene type") 
+```
+
+:::
+
+
+## Transcript region identification
+
+```{r}
+#| label: transcript region assignment rule
+#| message: false
+rule = c("intron", "cds", "utr3", "utr5")
+```
+
+To identify hosting transcript regions for each binding sites we overlap binding sites of protein-coding genes with the respective transcript regions (Introns, CDS, UTRs). Overlaps within transcripts are resolved by applying a majority vote system and ties are further resolved in a hierarchical manor with a fall back rule `r rule` in the case of ties.
+
+```{r}
+#| label: transcript region assignment
+#| message: false
+targetsProt = targetsGene[targetsGene$gene_type == "protein_coding"]
+bsProt = bsGene[bsGene$geneType == "protein_coding"]
+
+# export(bsProt, "./data/bsProt.bed", format = "BED")
+
+### count the overlap of each binidng site within each part of the gene
+cdseq = cds(anno.db) %>% countOverlaps(bsProt,.)
+intrns = unlist(intronsByTranscript(anno.db)) %>% countOverlaps(bsProt,.)
+utrs3 = unlist(threeUTRsByTranscript(anno.db)) %>% countOverlaps(bsProt,.)
+utrs5 = unlist(fiveUTRsByTranscript(anno.db)) %>% countOverlaps(bsProt,.)
+count.df = data.frame(cds = cdseq, intron = intrns, utr3 = utrs3, utr5 = utrs5)
+
+### applying the majority vote
+count.df = count.df[, rule] %>% 
+  as.matrix %>% 
+  cbind.data.frame(., outside = ifelse(rowSums(count.df) == 0, 1, 0) )
+names = colnames(count.df)
+reg = apply(count.df, 1, function(x){ names[which.max(x)] })
+### add region annotation to binding sites object
+mcols(bsProt)$region = reg
+```
+
+
+::: {.panel-tabset}
+
+### Transcript region overlaps
+
+```{r, fig.width=8, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Overlap of binding sites with different transcript regions. Conflicting transcript annotations are resolved by transcript reigon.
+#| 
+plotCountDf = count.df
+plotCountDf[plotCountDf > 1] = 1
+m = make_comb_mat(plotCountDf)
+ha = HeatmapAnnotation(
+  "Intersections" = anno_barplot(comb_size(m), border = FALSE, gp = gpar(fill = "#595959"), height = unit(6, "cm"))
+)
+
+ht = UpSet(m,
+           comb_order = order(comb_size(m), decreasing = T),
+            top_annotation = ha,
+           comb_col = "cornflowerblue", bg_col = "white", pt_size = unit(.5, "cm") ,
+           border = T, lwd = 2, bg_pt_col = "#333333"
+)
+
+ss = set_size(m)
+cs = comb_size(m)
+ht = draw(ht,  padding = unit(c(0, 0, 10, 0), "mm"))
+od = column_order(ht)
+decorate_annotation("Intersections", {
+    grid.text(format(cs[od], big.mark = ",", decimal.mark = "."), x = seq_along(cs), y = unit(cs[od], "native") + unit(.1, "pt"), 
+        default.units = "native", just = c("left", "bottom"), 
+        gp = gpar(fontsize = 8, col = "black"), rot = 45)
+})
+```
+
+### Transcript regions
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: SF3B1 transcript binding spectrum. Percentage binding sites count per region.
+#
+### remove binding sites outside of annotated regions
+bsTranscript = bsProt[bsProt$region != "outside"]
+targetsTranscript = targetsProt[targetsProt$gene_id %in% bsTranscript$geneID]
+
+### make nice pie chart
+df = data.frame(Type = names(table(bsTranscript$region)), Freq = as.vector(table(bsTranscript$region)))
+df = df[order(df$Freq, decreasing = F),]
+df$Type = factor(df$Type, levels = df$Type)
+df$Frac = df$Freq / sum(df$Freq)
+df$ymax = cumsum(df$Frac)
+df$ymin = c(0, head(df$ymax, n=-1))
+df$labPos = (df$ymax + df$ymin) / 2
+df$NFrac = round(df$Frac * 100)
+df$NFrac2 = round(df$Freq / sum(df$Freq), digits = 4)
+df$NFracNice = df$NFrac2 * 100
+df$labelNice = paste0(format(df$Freq, big.mark = ",", decimal.mark = "."), " (", df$NFracNice, "%)")
+df$labelNice2 = paste0(df$Type, ": ", format(df$Freq, big.mark = ",", decimal.mark = "."), " (", df$NFracNice, "%)")
+
+ggplot(df, aes(x = Type, y = Freq, fill = Type, label = labelNice)) +
+    geom_col() +
+    geom_text(data = df, aes(x = Type, y = 0), size = 6, color = "lightgrey", hjust = -.3) +
+    scale_y_log10() +
+    coord_flip(clip = "on", expand = TRUE) +
+    scale_fill_npg() +
+    theme(legend.position = "none") +
+    labs(title = "Binding spectrum",
+         subtitle = "Bar-chart (absolute values)",
+         y = "Number of binding sites",
+         x = NULL) +
+    theme_pub() +
+    theme(aspect.ratio = 1, legend.position = "none") 
+```
+
+::: 
+
+## Region size normalization
+
+When assessing the number of binding sites per transcript region, the length of the hosting region has a strong effect on the raw number of counted binding sites. Here we use the mean region length to normalize for this effect. 
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Mean length normalization of binding sites per genomic region
+cdsLen = cds(anno.db) %>% 
+  subsetByOverlaps(., bsTranscript) %>% width %>% sum
+intrnsLen = unlist(intronsByTranscript(anno.db)) %>% 
+  subsetByOverlaps(., bsTranscript) %>% width %>% sum
+utrs3Len = unlist(threeUTRsByTranscript(anno.db)) %>% 
+  subsetByOverlaps(., bsTranscript) %>% width %>% sum
+utrs5Len = unlist(fiveUTRsByTranscript(anno.db)) %>% 
+  subsetByOverlaps(., bsTranscript) %>% width %>% sum
+lenDfSum = data.frame(lenSum = c(cdsLen, intrnsLen, utrs3Len, utrs5Len))
+
+
+df = data.frame(type = names(table(bsTranscript$region)), val = as.vector(table(bsTranscript$region)))
+df = cbind(df, lenDfSum)
+df = df[order(df$val, decreasing = F),]
+df$type = factor(df$type, levels = df$type)
+
+ggplot(df, aes(x = type, y = val/lenSum, fill = type)) +
+  geom_col(color = "black") + 
+  scale_fill_npg() +
+  coord_flip() +
+  theme_pub() +
+  xlab("Type") +
+  ylab("Scaled count [mean(length)]") +
+  theme(legend.position = "none") 
+```
+
+
+# Tables and numbers
+
+```{r}
+### ============================================================================
+### Numbers
+### ----------------------------------------------------------------------------
+###
+
+peaksInitial = peaksInitial[!seqnames(peaksInitial) %in% "chrY"]
+b1 = setRanges(bds, peaksInitial)
+c1 = coverageOverRanges(b1, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+peaksFiltered = peaksFiltered[!seqnames(peaksFiltered) %in% "chrY"]
+b2 = setRanges(bds, peaksFiltered)
+c2 = coverageOverRanges(b2, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b25 = setRanges(bds, peaksFilteredPerGene)
+c25 = coverageOverRanges(b25, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b3 = setRanges(bds, peaksProcessed)
+c3 = coverageOverRanges(b3, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b4 = setRanges(bds, peaksReproducible)
+c4 = coverageOverRanges(b4, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b5 = setRanges(bds, bsGene)
+c5 = coverageOverRanges(b5, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b6 = setRanges(bds, bsProt)
+c6 = coverageOverRanges(b6, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+b7 = setRanges(bds, bsTranscript)
+c7 = coverageOverRanges(b7, returnOptions = "merge_positions_keep_replicates") %>% mcols() %>% as.matrix()
+
+df = data.frame(nPeaks = c(length(peaksInitial),
+                           length(peaksFiltered),
+                           length(peaksFilteredPerGene),
+                           length(peaksProcessed), 
+                           length(peaksReproducible), 
+                           length(bsGene),
+                           length(bsProt), 
+                           length(bsTranscript)),
+                nTargets = c(length(subsetByOverlaps(gns, peaksInitial)),
+                             length(subsetByOverlaps(gns, peaksFiltered)),
+                             length(subsetByOverlaps(gns, peaksFilteredPerGene)),
+                             length(subsetByOverlaps(gns, peaksProcessed)),
+                             length(subsetByOverlaps(gns, peaksReproducible)),
+                             length(unique(bsGene$geneID)),
+                             length(unique(bsProt$geneID)),
+                             length(unique(bsTranscript$geneID)) ),
+                nXlinksMUT = c(sum(dplyr::select(as.data.frame(c1), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c2), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c25), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c3), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c4), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c5), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c6), ends_with("MUT"))),
+                               sum(dplyr::select(as.data.frame(c7), ends_with("MUT")))
+                ),
+                nXlinksWT = c(sum(dplyr::select(as.data.frame(c1), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c2), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c25), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c3), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c4), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c5), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c6), ends_with("WT"))),
+                              sum(dplyr::select(as.data.frame(c7), ends_with("WT")))
+                )
+)
+
+df = format(df, big.mark = ",", decimal.mark = ".")
+rownames(df) = c("CLS - PureCLIP", "CLS - Global filter", "CLS - Gene level filter", "BS - Merged", "BS - Reproducible", "BS - Gene", "BS - Protein", "BS - Transcript")
+colnames(df) = c("CLS/BS (N)", "Targets (N)", "Xlinks (MUT)", "Xlinks (WT)")
+
+kable(df, caption = "Processing Overview. CLS = Crosslink sites/ BS = Binding sites") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+```{r}
+### ============================================================================
+### xlinks in bs per replicate per filter step
+### ----------------------------------------------------------------------------
+###
+df = data.frame(
+  x1 = colSums(c1),
+  x2 = colSums(c2),
+  x25 = colSums(c25),
+  x3 = colSums(c3),
+  x4 = colSums(c4),
+  x5 = colSums(c5),
+  x6 = colSums(c6),
+  x7 = colSums(c7)
+)
+df = format(df, big.mark = ".", decimal.mark = ",")
+colnames(df) = c("CLS - PureCLIP", "CLS - Global filter", "CLS - Gene level filter", "BS - Merged", "BS - Reproducible", "BS - Gene", "BS - Protein", "BS - Transcript")
+rownames(df) = c("S1 - MUT", "S2 - MUT", "S3 - WT", "S4 - WT", "S5 - WT")
+df = t(df)
+
+kable(df, caption = "Xlinks in peaks/bs per replicate per filtering step") %>% 
+  kable_styling("striped") %>%
+  scroll_box(width = "100%")
+```
+
+
+# Binding patterns
+
+## Flanking regions next to exons 
+
+```{r}
+#| label: exon flanking regions
+#| message: false
+
+exn = exons(anno.db)
+export(granges(exn), "./data/exn.bed", format = "BED")
+# define flanking regsions 
+leftEdge = flank(exn, width = 100, start = TRUE)
+export(granges(leftEdge), "./data/leftEdge.bed", format = "BED")
+rightEdge = flank(exn, width = 100, start = FALSE)
+export(granges(rightEdge), "./data/rightEdge.bed", format = "BED")
+```
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Binding sites in introns split by near exon (within 100nt from splice sites) and deep-intronic regions
+
+# split BS in left /right
+# splti BS in left/ right/ both
+
+# split right side
+rightOLS = findOverlaps(bsTranscript, leftEdge) %>% as.data.frame()
+rightIDX = unique(rightOLS$queryHits)
+
+# split left side
+leftOLS = findOverlaps(bsTranscript, rightEdge) %>% as.data.frame()
+leftIDX = unique(leftOLS$queryHits)
+
+# make unique assignment
+bothSidesIDX = rightIDX[rightIDX %in% leftIDX]
+rightIDX = rightIDX[! rightIDX %in% bothSidesIDX]
+leftIDX = leftIDX[! leftIDX %in% bothSidesIDX]
+
+# split deep intronic
+deepIntronIDX = 1:length(bsTranscript)
+deepIntronIDX = deepIntronIDX[! deepIntronIDX %in% c(rightIDX, leftIDX, bothSidesIDX)]
+
+# annotate ranges
+rightBS = bsTranscript[rightIDX]
+leftBS = bsTranscript[leftIDX]
+bothSidesBS = bsTranscript[bothSidesIDX]
+deepIntronBS = bsTranscript[deepIntronIDX]
+mcols(rightBS)$intronLocation = "Near exon 3'"
+mcols(leftBS)$intronLocation = "Near exon 5'"
+mcols(bothSidesBS)$intronLocation = "Near exon both"
+mcols(deepIntronBS)$intronLocation = "Deep intron"
+
+bsTranscript = c(rightBS, leftBS, bothSidesBS, deepIntronBS)
+bsTranscript = sortSeqlevels(bsTranscript)
+bsTranscript = sort(bsTranscript)
+mcols(bsTranscript)$intronLocation = ifelse(bsTranscript$region != "intron", NA, bsTranscript$intronLocation)
+
+df = data.frame(intronLocation = bsTranscript$intronLocation) %>%
+    table() %>%
+    as.data.frame() 
+
+ggplot(df, aes(x = intronLocation, y = Freq, fill = intronLocation)) +
+    geom_col() +
+    geom_text(aes(label = myFormat(Freq)), vjust = -0.3) +
+    scale_fill_npg() +
+    theme_pub() +
+    theme(legend.position = "none") +
+    labs(
+        title = "Enhanced binding spectrum",
+         y = "Count (#N)",
+         x = "Location")
+
+```
+
+```{r}
+#| label: annotate binding sites with flanking regions
+#| message: false
+exn = exons(anno.db, columns = c("exon_id", "gene_id", "exon_name"))
+names(exn) = exn$exon_id
+export(granges(exn), "./data/exn.bed", format = "BED")
+
+exnBeforeIdx = follow(bsTranscript, exn) 
+exnBeforeIdx[is.na(exnBeforeIdx)] = 557990
+exnBeforeDist = distance(bsTranscript, exn[exnBeforeIdx])
+
+exnAfterIdx = precede(bsTranscript, exn)
+exnAfterIdx[is.na(exnAfterIdx)] = 557990
+exnAfterDist = distance(bsTranscript, exn[exnAfterIdx])
+
+
+distDf = data.frame(distBefore = exnBeforeDist, distAfter = exnAfterDist) %>%
+    mutate(side = ifelse(distBefore < distAfter, "before", "after")) %>%
+    mutate(distToExon = ifelse(distBefore < distAfter, distBefore, distAfter)) %>%
+    mutate(positionTag = ifelse(distToExon > 100, "deep intron", "near exon")) %>%
+    mutate(exonID = ifelse(side == "after", exnAfterIdx, exnBeforeIdx)) %>%
+    mutate(bsID = names(bsTranscript)) %>%
+    mutate(exonName = exn$exon_name[exonID]) %>%
+    select(positionTag, side, distToExon, exonID, bsID, exonName)
+
+mcols(bsTranscript) = cbind(mcols(bsTranscript), distDf)
+
+### export
+export(bsTranscript, "./data/bsTranscript.bed", format = "BED")
+save(bsTranscript, file = "./data/bsTranscript.rda")
+```
+
+## Distances 
+
+To find patterns in binding site spacing, we calculated the distance from each binding sites to its nearest neighbor. 
+
+::: {.panel-tabset}
+
+### Zoom-Out
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distance from each binding site to the next closest neighbor.
+dist = distanceToNearest(bsTranscript) %>% as.data.frame()
+bsTranscript$dist = dist$distance
+ggplot(dist, aes(x = log10(distance+1))) + 
+  geom_histogram(bins = 100, color = "black") + 
+  theme_nice() +
+  labs(
+    title = "Distance to nearest binding site",
+    x = "Distance +1 (nt) [log10]",
+    y = "Count") 
+
+```
+
+### Zoom-In
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distance from each binding site to the next closest neighbor in a range of 50 nt.
+ggplot(dist, aes(x = distance)) + 
+  geom_histogram(binwidth = 1, color = "black") + 
+  xlim(-1,50) +
+  theme_nice() +
+  labs(
+    title = "Distance to nearest binding site",
+    x = "Distance (nt) [0-50]",
+    y = "Count") +
+  geom_vline(xintercept = 7, linetype = "dashed")
+```
+
+:::
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```

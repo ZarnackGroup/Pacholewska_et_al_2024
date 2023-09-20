@@ -1,0 +1,517 @@
+---
+title: "SF3B1 iCLIP analysis"
+subtitle: "Binding site coverage profiles"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+author: 
+ - name: "Dr. Mirko Brueggemann"
+   email: mirko.brueggemann@bmls.de
+   affiliations:
+      - name: Buchman Institute for Molecular Life Sciences
+format: 
+    html:
+        theme: sandstone
+        code-fold: TRUE
+        code-overflow: scroll
+        code-summary: "Show code"
+        code-tools: TRUE
+        toc: TRUE
+        toc-depth: 3
+        toc-location: left
+        number-sections: TRUE
+        self-contained: TRUE
+        fontsize: 11pt
+crossref: 
+    fig-title: '**Figure**'
+    fig-labels: arabic
+    title-delim: "**.**"
+code-block-bg: "#EEEEEE"
+editor: 
+    markdown: 
+      wrap: 120
+---
+
+# Analysis Description
+
+Compute iCLIP meta profiles around genomic landmarks. In total four libraries are used and compared: SF3B1-WT, SF3B1-MUT, U2AF2-WT, SF3B1-WT-eCLIP (all in K562). As genomic landmarks, annotated splice sites and predicted branchpoints are used. 
+
+# Load libraries
+
+```{r}
+#| label: libraries
+#| message: false
+library(readr)
+library(circlize)
+library(patchwork)
+library(ggsci)
+library(ggnewscale)
+library(knitr)
+library(grid)
+library(gridGraphics)
+library(gridExtra)
+library(scales)
+library(reshape2)
+library(ggplot2)
+library(rtracklayer)
+library(GenomicFeatures)
+library(GenomicAlignments)
+library(viridis)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(kableExtra)
+library(GenomicRanges)
+library(BindingSiteFinder)
+library(ggnewscale)
+library(ggVennDiagram)
+library(branchpointer)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+#| label: load additional scripts
+#| message: false
+source("../styles.R")
+source("../helper.R")
+```
+
+# Data preparation
+
+For all comparisons the iCLIP signal is shown as the mean of means (mean of replicates and mean over respective ranges). No direct correction for library size was computed, since all replicates in the SF3B1 dataset were downsampled to the smallest sample. Thus profiles of the SF3B1 MUT and WT conditions can be compared directly. This is not possible for the U2AF2 or SF3B1-eCLIP dataset, which can only be evaluated from a positional point of view. In all profiles rows with only zeros (no iCLIP crosslinks) were removed.
+
+```{r}
+#| label: load gene annotation
+#| message: false
+load("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.rda")
+anno.db = loadDb("/Users/mirko/Projects/Annotations/human/gencode_36/filtered/gencode_v36_filtered.sqlite")
+gns = genes(anno.db)
+idx = match(gns$gene_id, anno$gene_id)
+elementMetadata(gns) = cbind(elementMetadata(gns), elementMetadata(anno)[idx,])
+```
+
+```{r}
+#| label: load all clip data
+#| message: false
+rngEnd = readRDS("../01_splicingMaps/data/rngEnd.rds")
+# Load clip data SF3B1 WT
+clipFilesWt = "/Users/mirko/Projects/sf3b1/01_data_subsamp/wt/cov/replicate"
+clipFiles = c(clipFilesWt)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "Plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "Minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = 1:3,
+  condition = factor(c("WT", "WT", "WT")),
+  clPlus = clipFilesP,
+  clMinus = clipFilesM)
+bdsSF3B1_WT = BSFDataSetFromBigWig(ranges = rngEnd, meta = colData)
+
+# Load clip data SF3B1 MUT
+clipFilesMut = "/Users/mirko/Projects/sf3b1/01_data_subsamp/mut/cov/replicate"
+clipFiles = c(clipFilesMut)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "Plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "Minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = 1:2,
+  condition = factor(c("MUT", "MUT")),
+  clPlus = clipFilesP,
+  clMinus = clipFilesM)
+bdsSF3B1_MUT = BSFDataSetFromBigWig(ranges = rngEnd, meta = colData)
+
+# Load clip data U2AF65 WT
+clipFilesWt = "/Users/mirko/Projects/BindingSiteStrength/01_data/05_U2AF65_cellLines/K562/cov/replicates/"
+clipFiles = c(clipFilesWt)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = 1:4,
+  condition = factor(rep("WT",4)),
+  clPlus = clipFilesP,
+  clMinus = clipFilesM)
+# creating objects and importing clip siganl
+bdsU2AF2_WT = BSFDataSetFromBigWig(ranges = rngEnd, meta = colData)
+
+# Load eclip data SF3B1 WT
+clipFilesWt = "/Users/mirko/Projects/sf3b1/04_eCLIP/sf3b1/"
+clipFiles = c(clipFilesWt)
+clipFiles = list.files(clipFiles, pattern = ".bw$", full.names = TRUE)
+clipFilesP = clipFiles[grep(clipFiles, pattern = "plus")]
+clipFilesM = clipFiles[grep(clipFiles, pattern = "minus")]
+# Organize clip data in dataframe
+colData = data.frame(
+  id = 1:2,
+  condition = factor(rep("WT",2)),
+  clPlus = clipFilesP,
+  clMinus = clipFilesM)
+# creating objects and importing clip siganl
+bdsSF3B1_ECLIP = BSFDataSetFromBigWig(ranges = rngEnd, meta = colData)
+
+clipData = list(bdsSF3B1_WT = bdsSF3B1_WT, 
+                bdsSF3B1_MUT = bdsSF3B1_MUT, 
+                bdsU2AF2_WT = bdsU2AF2_WT,
+                bdsSF3B1_ECLIP = bdsSF3B1_ECLIP)
+```
+
+## Splice sites
+
+```{r}
+#| label: clean splice sites from annotation
+#| message: false
+
+# ------------------------------------------------------------------------------
+# get all introns from annotation
+# ------------------------------------------------------------------------------
+intrns = intronsByTranscript(anno.db) %>% unlist()
+exn = exons(anno.db, use.names = TRUE)
+
+# ------------------------------------------------------------------------------
+# match 3'SS
+# ------------------------------------------------------------------------------
+# -> note:  additional matching step with positions from introns is needed to have 
+#           exon_ids for each splice sites, which allows machting with branchpoint
+#           prediction later on
+exn3pos = flank(unique(resize(exn, fix = "start", width = 1)), width = 1, start = TRUE)
+int3pos = unique(resize(intrns, fix = "end", width = 1))
+ss3Anno = subsetByOverlaps(exn3pos, int3pos)
+
+# ------------------------------------------------------------------------------
+# match 5'SS
+# ------------------------------------------------------------------------------
+exn5pos = flank(unique(resize(exn, fix = "end", width = 1)), width = 1, start = FALSE)
+int5pos = unique(resize(intrns, fix = "start", width = 1))
+ss5Anno = subsetByOverlaps(exn5pos, int5pos)
+```
+
+Annotated splice sites were extracted as all unique start/ end positions from exons in the GENCODE v36 annotation. In total this resulted in `r myFormat(length(ss3Anno))` 3'SS and `r myFormat(length(ss5Anno))` 5'SS. 
+Please note that the number of 3'/ 5' splice sites is not identical, since multiple 3'SS can relate to the same 5'SS and vice versa. 
+
+## Branchpoint predictions
+
+```{r}
+#| label: load branchpoint predictions
+#| message: false
+pred = readRDS("./data/pred.rds")
+names(pred) = 1:length(pred)
+
+predSelAll = pred %>% 
+  as.data.frame() %>%
+  group_by(exon_id) %>%
+  filter(branchpoint_prob == max(branchpoint_prob))
+
+predSel = pred %>% 
+  as.data.frame() %>%
+  group_by(exon_id) %>%
+  filter(branchpoint_prob > 0.52) %>%
+  mutate(nBps = n()) %>%
+  filter(branchpoint_prob == max(branchpoint_prob))
+
+bpPred = GRanges(seqnames = predSel$seqnames,
+                 ranges = IRanges(start = predSel$test_site, width = 1),
+                 strand = predSel$strand,
+                 gene_id = predSel$gene_id,
+                 gene_type = predSel$gene_type,
+                 exon_id = predSel$exon_id,
+                 to_3prime_point = predSel$to_3prime_point,
+                 to_5prime_point = predSel$to_5prime_point,
+                 ppt_run_length = predSel$ppt_run_length,
+                 U2_binding_energy = predSel$U2_binding_energy,
+                 branchpoint_prob = predSel$branchpoint_prob,
+                 nBps = predSel$nBps
+                 )
+```
+
+Branchpoints were again predicted by [branchpointer](https://www.bioconductor.org/packages/release/bioc/html/branchpointer.html), for each splice site in the annotation. Specifically, we extracted exons from protein coding genes annotated in GENCODE v36 were selected as seed to span an intronic search window of 27nt ranging from -18 to -44 from the 3' splice site. For each region the highest scoring branchpoint was selected, based on the 'branchpoint probability'. From these, significant branchpoints were selected based on a 'branchpoint probability' cutoff of 0.52 (recommended default). This resulted in `r myFormat(length(bpPred))` significant branchpoints.
+
+
+## Overlaps
+
+To achieve comparability between the two splice site and the branchpoint prediction set, we reduced each set to the union of all three, using the `exon_id` as matching identifier. This results in a set of 93.679 exons, represented by a single 3'SS, 5'SS and branchpoint.
+
+```{r, fig.width=5, fig.height=5}
+#| message: false
+#| warning: false
+#| fig-width: 5
+#| fig-height: 5
+#| fig-cap: Intersection of annotated splice sites and predicted branchpoints
+
+l = list(
+    spliceSites3 = unique(names(ss3Anno)),
+    spliceSites5 = unique(names(ss5Anno)),
+    branchpoints = bpPred$exon_id)
+exnIntersectionIDs = Reduce(intersect, l)
+ggVennDiagram(l, category.names = c("3'SS", "5'SS", "BP")) +
+    labs(title = "Exon union") +
+    scale_fill_viridis(option = "B") +
+    scale_color_aaas()
+```
+
+
+# Coverage profiles at landmarks
+
+Meta profiles of SF3B1 WT and MUT with additional eCLIP of SF3B1 and iCLIP of U2AF2 confirmes the double-peak binding pattern of SF3B1. 
+
+```{r, fig.width=8, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Coverage profiles
+makeDfPlotAll <- function(x, w, name, rngSs3, rngSs5, rngBp) {
+  # set frame
+  f3ss = rngSs3 + w
+  f5ss = rngSs5 + w
+  fbp = rngBp + w
+  
+  # calc 3'ss
+  currObj = setRanges(x, f3ss)
+  currCov = coverageOverRanges(currObj, returnOptions = "merge_all_replicates", method = "mean")
+  currCov = currCov[rowSums(currCov) > 0,] # This removes rows with all zeros !
+  # sum up coverage
+  df1Cov = data.frame(pos = -w:w, mean = colMeans(currCov), type = "3'SS", data = name) 
+  
+  # calc 5'ss
+  currObj = setRanges(x, f5ss)
+  currCov = coverageOverRanges(currObj, returnOptions = "merge_all_replicates", method = "mean")
+  currCov = currCov[rowSums(currCov) > 0,] # This removes rows with all zeros !
+  # sum up coverage
+  df2Cov = data.frame(pos = -w:w, mean = colMeans(currCov), type = "5'SS", data = name) 
+  
+  # calc bp
+  currObj = setRanges(x, fbp)
+  currCov = coverageOverRanges(currObj, returnOptions = "merge_all_replicates", method = "mean")
+  currCov = currCov[rowSums(currCov) > 0,] # This removes rows with all zeros !
+  # sum up coverage
+  df3Cov = data.frame(pos = -w:w, mean = colMeans(currCov), type = "BP", data = name) 
+
+  # make return  
+  dfCov = rbind(df1Cov, df2Cov, df3Cov)
+  d = list(dfCov = dfCov)
+  return(d)
+}
+
+ss3Intersect = ss3Anno[names(ss3Anno) %in% exnIntersectionIDs]
+ss5Intersect = ss5Anno[names(ss5Anno) %in% exnIntersectionIDs]
+bpIntersect = bpPred[bpPred$exon_id %in% exnIntersectionIDs]
+
+d1 = makeDfPlotAll(x = clipData$bdsSF3B1_WT, w = 100, name = "SF3B1-WT", rngSs3 = ss3Intersect, rngSs5 = ss5Intersect, rngBp = bpIntersect)
+d2 = makeDfPlotAll(x = clipData$bdsSF3B1_MUT, w = 100, name = "SF3B1-MUT", rngSs3 = ss3Intersect, rngSs5 = ss5Intersect, rngBp = bpIntersect)
+d3 = makeDfPlotAll(x = clipData$bdsU2AF2_WT, w = 100, name = "U2AF2", rngSs3 = ss3Intersect, rngSs5 = ss5Intersect, rngBp = bpIntersect)
+d4 = makeDfPlotAll(x = clipData$bdsSF3B1_ECLIP, w = 100, name = "SF3B1-eCLIP", rngSs3 = ss3Intersect, rngSs5 = ss5Intersect, rngBp = bpIntersect)
+
+dfCov = rbind(d1$dfCov,d2$dfCov,d3$dfCov,d4$dfCov)
+dfCov$type = factor(dfCov$type, levels = c("BP", "3'SS", "5'SS"))
+dfCov$data = factor(dfCov$data, levels = c("SF3B1-WT", "SF3B1-MUT", "U2AF2", "SF3B1-eCLIP"))
+
+dfCov1 = dfCov %>% filter(pos %in% c(-100:50) & type == "3'SS" | pos %in% c(-50:100) & type == "5'SS" | pos %in% c(-50:50) & type == "BP")
+
+
+ggplot(dfCov1, aes(x = pos, y = mean, color = data)) +
+    geom_line(size = 1) +
+    facet_grid(data~type, scales = "free") +
+    theme_nice() +
+    theme(legend.position = "none") +
+    scale_color_npg() +
+    labs(
+        x = "Position relative to BP and splice site (nt)",
+        y = "Mean iCLIP signal"
+    )
+```
+
+## Additional details
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Frequency of multiple branchpoint predicitons per region
+bpIntersect = bpPred[bpPred$exon_id %in% exnIntersectionIDs]
+bpIntersect$nBps2 = ifelse(bpIntersect$nBps > 4, 4, bpIntersect$nBps)
+
+df = bpIntersect$nBps %>%
+  table() %>%
+  as.data.frame() %>%
+  rename('#BP' = '.')
+
+ggplot(df, aes(x = `#BP`, y = Freq, fill = `#BP`)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(option = "rocket", discrete = TRUE) +
+  theme_pub() +
+  theme(legend.position = "top") 
+```
+
+```{r,fig.width=10, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 6
+#| fig-cap: Coverage profiles split by the number of significant branchpoint predictions.
+makeDfPlotAll <- function(x, w, name, set) {
+  # set frame
+  f3ss = set + w
+  # calc bp
+  currObj = setRanges(x, f3ss)
+  currCov = coverageOverRanges(currObj, returnOptions = "merge_all_replicates", method = "mean")
+  currCov = currCov[rowSums(currCov) > 0,] # This removes rows with all zeros !
+  df1Cov = data.frame(pos = -w:w, mean = colMeans(currCov), type = "3'SS", data = name) 
+  # make return  
+  dfCov = rbind(df1Cov)
+  d = list(dfCov = dfCov)
+  return(d)
+}
+
+bpIntersect = bpPred[bpPred$exon_id %in% exnIntersectionIDs]
+bpIntersect$nBps2 = ifelse(bpIntersect$nBps > 4, 4, bpIntersect$nBps)
+bpList = split(bpIntersect, bpIntersect$nBps2)
+
+d = lapply(bpList, function(x){
+  d1 = makeDfPlotAll(x = clipData$bdsSF3B1_WT, w = 100, name = "SF3B1-WT", set = x)
+  d2 = makeDfPlotAll(x = clipData$bdsSF3B1_MUT, w = 100, name = "SF3B1-MUT", set = x)
+  d3 = makeDfPlotAll(x = clipData$bdsU2AF2_WT, w = 100, name = "U2AF2", set = x)
+  d4 = makeDfPlotAll(x = clipData$bdsSF3B1_ECLIP, w = 100, name = "SF3B1-eCLIP", set = x)
+  dfCov = rbind(d1$dfCov,d2$dfCov,d3$dfCov,d4$dfCov)
+  dfCov$type = factor(dfCov$type, levels = c("3'SS", "5'SS"))
+  dfCov$data = factor(dfCov$data, levels = c("SF3B1-WT", "SF3B1-MUT", "U2AF2", "SF3B1-eCLIP"))
+  return(dfCov)
+})
+df = dplyr::bind_rows(d, .id = "variable")
+
+ggplot(df, aes(x = pos, y = mean, color = variable)) +
+  geom_line() +
+  facet_wrap(~data, scales = "free", ncol = 2) +
+  theme_nice() +
+  theme(legend.position = "right") +
+  scale_color_npg() +
+  xlim(-50,50)
+```
+
+```{r, fig.width=8, fig.height=8}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 8
+#| fig-cap: Coverage profiles split by the number of significant branchpoint predictions.
+ggplot(df, aes(x = pos, y = mean, color = variable)) +
+  geom_line() +
+  facet_grid(data~variable, scales = "free") +
+  theme_nice() +
+  theme(legend.position = "none") +
+  scale_color_npg() +
+  xlim(-50, 50)
+```
+ 
+# Coverage profiles at landmarks WT vs MUT
+
+The meta-profiles between SF3B1 WT and MUT differed at the second peak of the double-peak shape profile. This difference was tested systematically for each position in the indicated window using a T-Test. This tests for the mean difference between the two curves. Each splice site was used as center to span a symmetrical window of 401 nt. Each position in this window was tested separately (T-Test) and resulting P values were Benjamini-Hochberg corrected. Positions below a cutoff of P adjusted <= 0.01 were selected as significantly different.
+
+```{r, fig.width=12, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4
+#| fig-cap: Coverage profiles comparisson of SF3B1 WT and MUT signal
+d = makeCoverageAndCompare(x = clipData$bdsSF3B1_WT, y = clipData$bdsSF3B1_MUT,
+                   Xname = "SF3B1-WT", Yname = "SF3B1-MUT", w = 100,
+                   rngSs3 = ss3Intersect, rngSs5 = ss5Intersect, rngBp = bpIntersect)
+d$dfTest$sig = ifelse(d$dfTest$pAdj < 0.01, TRUE, FALSE)
+d$dfTest$type = factor(d$dfTest$type, levels = c("BP", "3'SS", "5'SS"))
+d$dfCov$type = factor(d$dfCov$type, levels = c("BP", "3'SS", "5'SS"))
+
+dfCov1 = d$dfCov %>% filter(pos %in% c(-100:50) & type == "3'SS" | pos %in% c(-50:100) & type == "5'SS" | pos %in% c(-50:50) & type == "BP")
+dfTest1 = d$dfTest %>% filter(pos %in% c(-100:50) & type == "3'SS" | pos %in% c(-50:100) & type == "5'SS" | pos %in% c(-50:50) & type == "BP")
+
+ggplot() +
+    geom_line(data = dfCov1, aes(x = pos, y = mean, color = data)) +
+    scale_color_npg() +
+    ggnewscale::new_scale_color() +
+    geom_point(data = subset(dfTest1, sig == FALSE), aes(x = pos, y = -.05, color = sig), size = 4, shape = 73, stroke = 3) +
+    geom_point(data = subset(dfTest1, sig == TRUE), aes(x = pos, y = -.01, color = sig), size = 4, shape = 73, stroke = 3) +
+    scale_color_brewer(palette = "Dark2", direction = -1) +
+    facet_wrap(~type, scales = "free") +
+    theme_nice() +
+    theme(legend.position = "top") +
+    labs(
+        x = "Position relative to genomic landmark",
+        y = "Crosslinks (mean of means)"
+    )
+```
+
+## Additional details
+
+```{r, fig.width=10, fig.height=8}
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-cap: Coverage profiles comparisson of SF3B1 WT and MUT signal, split by the number of significant branchpoint predictions.
+#| 
+bpIntersect = bpPred[bpPred$exon_id %in% exnIntersectionIDs]
+bpIntersect$nBps2 = ifelse(bpIntersect$nBps > 4, 4, bpIntersect$nBps)
+bpList = split(bpIntersect, bpIntersect$nBps2)
+
+d = lapply(bpList, function(x){
+  currExns = x$exon_id
+  d = makeCoverageAndCompare(x = clipData$bdsSF3B1_WT, y = clipData$bdsSF3B1_MUT,
+                   Xname = "SF3B1-WT", Yname = "SF3B1-MUT", w = 100,
+                   rngSs3 = subset(ss3Intersect, names(ss3Intersect) %in% currExns),
+                   rngSs5 = subset(ss5Intersect, names(ss5Intersect) %in% currExns),
+                   rngBp = subset(bpIntersect, exon_id %in% currExns))
+  d$dfTest$sig = ifelse(d$dfTest$pAdj < 0.01, TRUE, FALSE)
+  d$dfTest$type = factor(d$dfTest$type, levels = c("BP", "3'SS", "5'SS"))
+  d$dfCov$type = factor(d$dfCov$type, levels = c("BP", "3'SS", "5'SS"))
+  
+  return(d)  
+})
+dfCov1 = d$`1`$dfCov
+dfCov1$var = 1
+dfCov2 = d$`2`$dfCov
+dfCov2$var = 2
+dfCov3 = d$`3`$dfCov
+dfCov3$var = 3
+dfCov4 = d$`4`$dfCov
+dfCov4$var = 4
+dfCov = rbind(dfCov1, dfCov2, dfCov3, dfCov4)
+
+dfTest1 = d$`1`$dfTest
+dfTest1$var = 1
+dfTest2 = d$`2`$dfTest
+dfTest2$var = 2
+dfTest3 = d$`3`$dfTest
+dfTest3$var = 3
+dfTest4 = d$`4`$dfTest
+dfTest4$var = 4
+dfTest = rbind(dfTest1, dfTest2, dfTest3, dfTest4)
+
+dfCovSub = dfCov %>% filter(pos %in% c(-100:50) & type == "3'SS" | pos %in% c(-50:100) & type == "5'SS" | pos %in% c(-50:50) & type == "BP")
+dfTestSub = dfTest %>% filter(pos %in% c(-100:50) & type == "3'SS" | pos %in% c(-50:100) & type == "5'SS" | pos %in% c(-50:50) & type == "BP")
+
+
+ggplot() +
+  geom_line(data = dfCovSub, aes(x = pos, y = mean, color = data)) +
+  scale_color_npg() +
+  ggnewscale::new_scale_color() +
+  geom_point(data = subset(dfTestSub, sig == FALSE), aes(x = pos, y = -.05, color = sig), size = 4, shape = 73, stroke = 3) +
+  geom_point(data = subset(dfTestSub, sig == TRUE), aes(x = pos, y = -.01, color = sig), size = 4, shape = 73, stroke = 3) +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  facet_grid(var~type, scales = "free") +
+  theme_nice() +
+  theme(legend.position = "top") +
+  labs(
+    x = "Position relative to genomic landmark",
+    y = "Crosslinks (mean of means)"
+  )
+```
+
+
+# Session Information
+
+```{r, session_info, include=TRUE, echo=TRUE, results='markup'}
+sessionInfo()
+```
+
+

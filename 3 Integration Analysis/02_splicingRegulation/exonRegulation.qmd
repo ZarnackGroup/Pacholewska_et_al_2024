@@ -1,0 +1,933 @@
+---
+title: "SF3B1 splicing analysis"
+subtitle: "Exon regulation"
+date: "`r format(Sys.time(), '%B %e, %Y')`"
+author: 
+ - name: "Dr. Mirko Brueggemann"
+   email: mirko.brueggemann@bmls.de
+   affiliations:
+      - name: Buchman Institute for Molecular Life Sciences
+format: 
+    html:
+        theme: sandstone
+        code-fold: TRUE
+        code-overflow: scroll
+        code-summary: "Show code"
+        code-tools: TRUE
+        toc: TRUE
+        toc-depth: 3
+        toc-location: left
+        number-sections: TRUE
+        self-contained: TRUE
+        fontsize: 11pt
+crossref: 
+    fig-title: '**Figure**'
+    fig-labels: arabic
+    title-delim: "**.**"
+code-block-bg: "#EEEEEE"
+editor: 
+    markdown: 
+      wrap: 120
+---
+
+
+# Analysis description
+
+This report holds all analysis and plots used to create main figure 5 D-F with and all related supplementary figures.
+
+## Load libraries
+
+```{r}
+#| label: libraries
+#| message: false
+library(rtracklayer)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(ggplot2)
+library(AnnotationDbi)
+library(dplyr)
+library(tidyr)
+library(ggsci)
+library(ggrastr)
+library(patchwork)
+library(rstatix)
+library(ggpubr)
+```
+
+```{r}
+#| label: load additional scripts
+#| message: false
+source("../styles.R")
+source("../helper.R")
+```
+
+
+
+# Alternative AGs at 3' splice sites
+
+```{r}
+#| label: read maxent results
+#| message: false
+ss3PacBioEnd_1 = readRDS("../02_splicingRegulation/data/ss3PacBioEnd_1.rds")
+ss3PacBioEnd_2 = readRDS("../02_splicingRegulation/data/ss3PacBioEnd_2.rds")
+ss3PacBioEnd = readRDS("../02_splicingRegulation/data/ss3PacBioEnd.rds")
+grAgPacBio = readRDS("../02_splicingRegulation/data/grAgPacBio.rds")
+maxEntRes = read.csv("../02_splicingRegulation/data/seqsAGsPacBio_maxEnt.fasta", header = FALSE, sep = "\t")
+
+maxEntResScore = sapply(strsplit(maxEntRes$V2,":"), `[`, 2)
+maxEntResScore = maxEntResScore[!is.na(maxEntResScore)]
+maxEntResScore = as.numeric(maxEntResScore)
+
+maxEntResExonID = sapply(strsplit(maxEntRes$V1,"_"), `[`, 1)
+maxEntResExonID = maxEntResExonID[grepl(">", maxEntResExonID)]
+maxEntResExonID = gsub(x = maxEntResExonID, pattern = ">", replacement = "")
+
+maxEntAgID = maxEntRes$V1
+maxEntAgID = maxEntAgID[grepl(">", maxEntAgID)]
+maxEntAgID = gsub(x = maxEntAgID, pattern = ">", replacement = "")
+
+maxEntRes = data.frame(exonID = maxEntResExonID, agID = maxEntAgID, score = maxEntResScore)
+
+grAgPacBio$maxEntScore = maxEntRes$score[match(grAgPacBio$combID, maxEntRes$agID)]
+
+### ----------------------------------------------------------------------------
+###                   Add PacBio splicing results to PacBio AGs
+### ----------------------------------------------------------------------------
+###
+idx = match(grAgPacBio$exonID, ss3PacBioEnd$exonID)
+grAgPacBio$regulation = ss3PacBioEnd$regulation[idx]
+grAgPacBio$sig = ss3PacBioEnd$sig[idx]
+grAgPacBio$sigAlt = ifelse(grAgPacBio$isAlternative == "Yes" & grAgPacBio$sig == TRUE, "Yes", "No")
+
+```
+
+For this analysis we used all significant 3' alternative splicing events detected in the IsoSeq analysis (N = `r myFormat(length(ss3PacBioEnd_1))`). The ranges of these events were reduced to unique 3' splice site positions (N = `r myFormat(length(ss3PacBioEnd_2))`). For overlapping events, the one with the lowest adjusted P value is preferred. Resulting 3'SS that do not have a classical *AG* splice site were removed as well, leaving a final set of `r myFormat(length(ss3PacBioEnd))` splice sites. 
+
+The final set is split by whether the events elongates or shortens the exons. This regulation type is defined based on the `deltaPSI` value from the IsoSeq analysis. A positive value indicates that introns become *shorter* and a negative value indicates that introns become *longer* (N = `r myFormat(table(ss3PacBioEnd$regulation))`, respectively).
+
+
+![Schematic of canonical and putative AGs on alternative 3' splicing events.](./plots/ag_options.png){width=80%}
+
+
+## Splice site strength by MaxEntScan
+
+The splice site strength analysis was performed with all putative *AGs* for each of the detected 3'splice sites. That is all *AGs* present in a 150nt window (100nt into the intron and 50nt into the exon) from the detected splice site.
+
+[MaxEntScan](http://hollywood.mit.edu/burgelab/maxent/Xmaxentscan_scoreseq_acc.html) requires a specific sequence of *23nt* around each site has to be used. This sequence consists of exactly 20nt into the intron plus 3nt of the exon. 
+
+
+::: {.panel-tabset}
+
+### 3 Color option
+
+```{r, fig.width=8, fig.height=8}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 8
+#| fig-cap: Splice site strength for all putative AGs at events where the intron becomes shorter (exon gets longer). The splice site strength map is ccompanied by additional plots showing the number of AGs per nucleotide, as well as the proportion of these AGs among the highlighted groups.
+### ----------------------------------------------------------------------------
+###                   Make MaxEnt splicing map
+### ----------------------------------------------------------------------------
+###
+dfMain = mcols(grAgPacBio) %>%
+    as.data.frame() %>%
+    mutate(agDist = ifelse(agID2 >= 0, -(99-agPosition), agPosition)) %>%
+    mutate(color = ifelse(sigAlt == "Yes", "Evt sig + Alt AG",
+                          ifelse(sigAlt == "No" & isAlternative == "Yes", "Evt not sig + Alt AG", "Evt not sig + Other AG"))) %>%
+    mutate(color = factor(color, levels = c("Evt not sig + Other AG", "Evt not sig + Alt AG", "Evt sig + Other AG", "Evt sig + Alt AG"))) %>%
+    arrange(color) %>%
+    filter(regulation == "shorter_introns")
+
+dfCanonicalSites = dfMain %>% filter(agID2 == 0)
+
+p0 = ggplot() +
+    geom_point_rast(data = dfCanonicalSites, aes(x = agDist, y = maxEntScore),
+               color = "#F2D388",size = 4, alpha = 0.5) +
+    geom_point(data = dfMain, aes(x = agDist, y = maxEntScore, color = color),
+               shape = 1, size = 1) +
+    theme_pub() +
+    annotate(geom = "rect", xmin = -100, xmax = 50, ymin = -59, ymax = -61) +
+    annotate(geom = "rect", xmin = 0, xmax = 50, ymin = -55, ymax = -65) +
+    annotate(geom = "rect", xmin = 0-21, xmax = 0-12, ymin = -Inf, ymax = Inf, color = "black", fill = NA, alpha = 0.5) +
+    theme(legend.position = "bottom") +
+    scale_color_nice_map_b() +
+    labs(
+        x = "Position of putative and used alternative 3' splice sites relative to the canonical [nt]",
+        y = "Splice site strength (MaxEntScore)",
+        color = "Legend") +
+    guides(colour = guide_legend(override.aes = list(size=5, shape = 15)))
+
+### ----------------------------------------------------------------------------
+###                   Bin AG position and add histograms
+### ----------------------------------------------------------------------------
+###
+bins = seq(from = -99, to = 53, by = 3)
+matchedBinInterval = findInterval(dfMain$agDist, bins, all.inside = TRUE, rightmost.closed = TRUE)
+
+dfBin1 = dfMain %>%
+    mutate(bin = bins[matchedBinInterval]) %>%
+    group_by(bin) %>%
+    tally()
+
+p1 = ggplot(dfBin1, aes(x = bin, y = (n))) +
+    geom_col(position = "dodge", fill = "#808080") +
+    theme_pub() +
+    theme(legend.position = "none") +
+    theme(axis.title.x=element_blank()) +
+    labs(y = "#N") 
+
+dfBin2 = dfMain %>%
+    mutate(bin = bins[matchedBinInterval]) %>%
+    group_by(bin, color) %>%
+    tally() %>%
+    mutate(color = as.factor(color))
+
+p2 = ggplot(dfBin2, aes(x = bin, y = (n), fill = color)) +
+    geom_col(position = "fill") +
+    scale_fill_nice_map_b() +
+    theme_pub() +
+    theme(legend.position = "none") +
+    theme(axis.title.x=element_blank()) +
+    labs(y = "Proportion")
+
+### ----------------------------------------------------------------------------
+###                   Make combine plot
+### ----------------------------------------------------------------------------
+###
+(p1 / p2 / p0) + 
+    plot_layout(heights = c(2,2,6)) + 
+    plot_annotation(title = "3'splice sites from PacBio defined exons",
+                    subtitle = paste0("Total of ", myFormat(nrow(dfMain)),
+                          " AGs from ", myFormat(length(unique(dfMain$exonID))),
+                          " events, with ",  myFormat(nrow(subset(dfMain, isAlternative == "Yes"))),
+                          " used alternative AGs from ", myFormat(length(unique(dfMain$exonID[dfMain$isAlternative == "Yes"]))),
+                          " events.\nAnd ", myFormat(nrow(subset(dfMain, sigAlt == "Yes"))),
+                          " used alternative AGs that are significant from ", myFormat(length(unique(dfMain$exonID[dfMain$sigAlt == "Yes"]))),
+                          " events."
+                          ))
+ggsave("maxEntPlot_v1.pdf", width = 8, height = 8, device = "pdf", path = "./plots/")
+```
+
+### 4 Color option
+
+```{r, fig.width=8, fig.height=8}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 8
+#| fig-cap: Splice site strength for all putative AGs at events where the intron becomes shorter (exon gets longer). The splice site strength map is ccompanied by additional plots showing the number of AGs per nucleotide, as well as the proportion of these AGs among the highlighted groups.
+### ----------------------------------------------------------------------------
+###                   Make MaxEnt splicing map
+### ----------------------------------------------------------------------------
+###
+dfMain = mcols(grAgPacBio) %>%
+    as.data.frame() %>%
+    mutate(agDist = ifelse(agID2 >= 0, -(99-agPosition), agPosition)) %>%
+    mutate(color = ifelse(sig == TRUE & isAlternative == "Yes", "Evt sig + Alt AG",
+                          ifelse(sig == FALSE & isAlternative == "Yes", "Evt not sig + Alt AG",
+                                 ifelse(sig == TRUE & isAlternative == "No", "Evt sig + Other AG", "Evt not sig + Other AG")))) %>%
+    mutate(color = factor(color, levels = c("Evt not sig + Other AG", "Evt sig + Other AG", "Evt not sig + Alt AG", "Evt sig + Alt AG"))) %>%
+    arrange(color) %>%
+    filter(regulation == "shorter_introns")
+
+dfCanonicalSites = dfMain %>% filter(agID2 == 0)
+
+p0 = ggplot() +
+    geom_point_rast(data = dfCanonicalSites, aes(x = agDist, y = maxEntScore),
+                    color = "#F2D388",size = 4, alpha = 0.5) +
+    geom_point(data = dfMain, aes(x = agDist, y = maxEntScore, color = color),
+               shape = 1, size = 1) +
+    theme_pub() +
+    annotate(geom = "rect", xmin = -100, xmax = 50, ymin = -59, ymax = -61) +
+    annotate(geom = "rect", xmin = 0, xmax = 50, ymin = -55, ymax = -65) +
+    annotate(geom = "rect", xmin = 0-21, xmax = 0-12, ymin = -Inf, ymax = Inf, color = "black", fill = NA, alpha = 0.5) +
+    theme(legend.position = "bottom") +
+    scale_color_nice_full_b() +
+    labs(
+        x = "Position of putative and used alternative 3' splice sites relative to the canonical [nt]",
+        y = "Splice site strength (MaxEntScore)",
+        color = "Legend") +
+    guides(fill=guide_legend(ncol=2), color = guide_legend(ncol=2)) +
+    guides(colour = guide_legend(override.aes = list(size=5, shape = 15)))
+
+### ----------------------------------------------------------------------------
+###                   Bin AG position and add histograms
+### ----------------------------------------------------------------------------
+###
+bins = seq(from = -99, to = 53, by = 3)
+matchedBinInterval = findInterval(dfMain$agDist, bins, all.inside = TRUE, rightmost.closed = TRUE)
+
+dfBin1 = dfMain %>%
+    mutate(bin = bins[matchedBinInterval]) %>%
+    group_by(bin) %>%
+    tally()
+
+p1 = ggplot(dfBin1, aes(x = bin, y = (n))) +
+    geom_col(position = "dodge", fill = "#808080") +
+    theme_pub() +
+    theme(legend.position = "none") +
+    theme(axis.title.x=element_blank()) +
+    labs(y = "#N") 
+
+dfBin2 = dfMain %>%
+    mutate(bin = bins[matchedBinInterval]) %>%
+    group_by(bin, color) %>%
+    tally() %>%
+    mutate(color = as.factor(color))
+
+p2 = ggplot(dfBin2, aes(x = bin, y = (n), fill = color)) +
+    geom_col(position = "fill") +
+    scale_fill_nice_full_b() +
+    theme_pub() +
+    theme(legend.position = "none") +
+    theme(axis.title.x=element_blank()) +
+    labs(y = "Proportion")
+
+### ----------------------------------------------------------------------------
+###                   Make combine plot
+### ----------------------------------------------------------------------------
+###
+(p1 / p2 / p0) + 
+    plot_layout(heights = c(2,2,6)) + 
+    plot_annotation(title = "3'splice sites from PacBio defined exons",
+                    subtitle = paste0("Total of ", myFormat(nrow(dfMain)),
+                                      " AGs from ", myFormat(length(unique(dfMain$exonID))), 
+                                      " events.\nWith ", as.character(myFormat(table(dfMain$color)[1])), " ", as.character(names(table(dfMain$color)[1])),
+                                      " AGs and, ", as.character(myFormat(table(dfMain$color)[2])), " ", as.character(names(table(dfMain$color)[2])),
+                                      " AGs and,\n", as.character(myFormat(table(dfMain$color)[3])), " ", as.character(names(table(dfMain$color)[3])),
+                                      " AGs and, ", as.character(myFormat(table(dfMain$color)[4])), " ", as.character(names(table(dfMain$color)[4]))
+                    )
+    )
+ggsave("maxEntPlot_v2.pdf", width = 8, height = 8, device = "pdf", path = "./plots/")
+```
+
+:::
+
+
+# Exon AG features (by AG)
+
+Here AG features, like splice site strength and distances, are grouped based on the relative position of the alternative AG. This means from every splicing event, always the first, second, third, etc. AG fall into the same bin.
+
+Note that the first position (AG-1) is probably influenced by the NAGNAG sites or similar splice sites. To avoid a biased distribution, I removed such sites, by filtering for distances of 3,4,5 and 6 nt. This means that all AGs on these position were removed.
+
+
+## Distances to canonical AG
+
+Here we calculate the distance in nt from the canonical splice site up to the 5th putative alternative AG within the first 50nt to the canonical splice site.
+
+::: {.panel-tabset}
+
+### Boxplot
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Distance to the canonical splice site for all putative alternative AGs. Significance by T-test with Benjamini-Hochberg correction.
+dfAll = mcols(grAgPacBio) %>% 
+    as.data.frame() %>%
+    filter(regulation == "shorter_introns") %>%
+    mutate(agDist = abs(agPosition - 99)) %>%
+    filter(agID2 > 0 & agID2 <= 5) %>%
+    mutate(agID2 = factor(agID2)) %>%
+    select(agPosition, agID2, agDist, isAlternative, maxEntScore, sig, sigAlt) %>%
+    filter(agDist <= 50)
+
+dfFilter = dfAll %>% filter(!agDist %in% c(3,4,5,6)) 
+
+dfUsed = dfFilter %>% filter(isAlternative == "Yes") %>%
+    mutate(agID2 = "Alt")
+
+dfNotUsed = dfFilter %>% filter(isAlternative == "No") %>%
+    mutate(agID2 = "Not Used")
+
+dfPlot = rbind.data.frame(dfFilter, dfUsed, dfNotUsed) 
+
+nC = dfPlot %>% 
+    group_by(sig, agID2) %>% 
+    summarise(count = n()) %>%
+    mutate(count = myFormat(count))
+
+p = ggplot() +
+    geom_boxplot(data = dfPlot, aes(x = agID2, y = agDist, fill = sig, color = sig), outlier.size = 0.5) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    scale_fill_nice_gr_b() +
+    scale_color_nice_gr_d() +
+    labs(
+        title = "Distance between canonical and alternative AGs",
+        subtitle = paste0("NAGNAG sites removed (all=", myFormat(nrow(dfAll)), ", removed=", myFormat(nrow(dfFilter)), "),\nwith P value by T-test and BH."),
+        x = "Putative AG",
+        y = "Distance to canonical AG",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_vline(xintercept = 5.5, linetype = "dashed") +
+    geom_text(data = nC, aes(x = agID2, y = 0, label = count, group = sig), position = position_dodge(width = 0.8), angle = 45, size = 2.5)
+
+
+statTest = dfPlot %>%
+    group_by(agID2) %>%
+    t_test(agDist ~ sig) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "agID2", dodge = 0.8) %>%
+    mutate(y.position = 55.1)
+
+p + stat_pvalue_manual(data = statTest, label = "p", tip.length = 0.02, size = 3) 
+
+ggsave("features_distance_bar.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+
+### Barchart
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Proportion of alternative AGs within putative AG groups. 79.6% of the 206 putative first AGs are truly used alternatives. 
+df = dfPlot %>%
+    group_by(sig, isAlternative, agID2) %>%
+    tally() %>%
+    group_by(sig, agID2) %>%
+    summarize(sig, isAlternative, agID2, n, grpSum = sum(n)) %>%
+    arrange(agID2) %>%
+    mutate(frac = round((n / grpSum) *100, digits = 1)) %>%
+    filter(isAlternative == "Yes")
+
+ggplot(df, aes(x = agID2, y = frac, fill = sig)) +
+    geom_col(position = position_dodge(preserve = 'single')) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    scale_fill_nice_gr_b() +
+    scale_color_nice_gr_d() +
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    labs(
+        # title = "Proportion of alternative AGs at given position",
+        x = "Alternative AG",
+        y = "Proportion of alternative AGs",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_vline(xintercept = 5.5, linetype = "dashed") 
+
+ggsave("features_distance_box.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+:::
+
+
+
+## Splice site strength by AG
+
+Here we calculate the splice site strength with MaxEnt for the first 5 putative alternative AG within the first 50nt to the canonical splice site.
+
+::: {.panel-tabset}
+
+### Boxplot - V1
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Splice site strength of putative alternative AG. Significance by T-test with Benjamini-Hochberg correction.
+dfAll = mcols(grAgPacBio) %>% 
+    as.data.frame() %>%
+    filter(regulation == "shorter_introns") %>%
+    mutate(agDist = abs(agPosition - 99)) %>%
+    filter(agID2 >= 0 & agID2 <= 5) %>%
+    mutate(agID2 = factor(agID2)) %>%
+    select(agPosition, agID2, agDist, isAlternative, maxEntScore, sig, sigAlt) %>%
+    filter(agDist <= 50) 
+
+dfFilter = dfAll %>% filter(!agDist %in% c(3,4,5,6)) 
+
+dfUsed = dfFilter %>% filter(isAlternative == "Yes") %>%
+    mutate(agID2 = "Alt")
+
+dfNotUsed = dfFilter %>% filter(isAlternative == "No") %>%
+    mutate(agID2 = "Not Used")
+
+dfPlot = rbind.data.frame(dfFilter, dfUsed, dfNotUsed) 
+
+nC = dfPlot %>% 
+    group_by(sig, agID2) %>% 
+    summarise(count = n()) %>%
+    mutate(count = myFormat(count))
+
+p = ggplot() +
+    geom_boxplot(data = dfPlot, aes(x = agID2, y = maxEntScore, fill = sig, color = sig), outlier.size = 0.5) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    scale_fill_nice_gr_b() +
+    scale_color_nice_gr_d() +
+    labs(
+        title = "Strength of putative AGs",
+        subtitle = paste0("NAGNAG sites removed (all=", myFormat(nrow(dfAll)), ", removed=", myFormat(nrow(dfFilter)), "),\nwith P value by T-test and BH."),
+        x = "Putative AG",
+        y = "Splice site strength (maxEntScore)",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_vline(xintercept = 5.5, linetype = "dashed") +
+    geom_text(data = nC, aes(x = agID2, y = 0, label = count, group = sig), position = position_dodge(width = 0.8), angle = 45, size = 2.5)
+
+
+statTest = dfPlot %>%
+    group_by(agID2) %>%
+    t_test(maxEntScore ~ sig) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "agID2", dodge = 0.8) %>%
+    mutate(y.position = 19.1)
+
+p + stat_pvalue_manual(data = statTest, label = "p", tip.length = 0.02, size = 2.5) 
+
+ggsave("features_maxEnt_box_v1.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Boxplot - V2
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Splice site strength of putative alternative AG. Significance by T-test with Benjamini-Hochberg correction.
+p = ggplot() +
+    geom_boxplot(data = dfFilter, aes(x = agID2, y = maxEntScore, fill = sig, color = sig), outlier.size = 0.5) +
+    scale_fill_nice_gg_b() +
+    scale_color_nice_gg_d() +
+    ggnewscale::new_scale_color() +
+    ggnewscale::new_scale_fill() +
+    geom_jitter(data = subset(dfFilter, isAlternative == "Yes"),
+                aes(x = agID2, y = maxEntScore, color = sig),
+                size = 0.2, position = position_jitterdodge()) +
+    scale_color_nice_br_b() +
+    theme_pub() +
+    theme(legend.position = "top") +
+    guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+    labs(
+        title = "Strength of putative AGs",
+        subtitle = paste0("NAGNAG sites removed (all=", myFormat(nrow(dfAll)), ", removed=", myFormat(nrow(dfFilter)), ")"),
+        x = "Putative AG",
+        y = "Splice site strength (maxEntScore)",
+        color = "Type",
+        fill = "Type"
+    ) 
+
+statTest = dfFilter %>%
+    group_by(agID2) %>%
+    t_test(maxEntScore ~ sig) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "agID2", dodge = 0.8) %>%
+    mutate(y.position = 19.1)
+
+p + stat_pvalue_manual(data = statTest, label = "p", tip.length = 0.02, size = 2.5) 
+
+ggsave("features_maxEnt_box_v2.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Boxplot - V3
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Splice site strength of putative alternative AG.
+dfAll = mcols(grAgPacBio) %>% 
+    as.data.frame() %>%
+    filter(regulation == "shorter_introns") %>%
+    mutate(agDist = abs(agPosition - 99)) %>%
+    filter(agID2 >= 0 & agID2 <= 5) %>%
+    mutate(agID2 = factor(agID2)) %>%
+    select(agPosition, agID2, agDist, isAlternative, maxEntScore, sig, sigAlt) %>%
+    filter(agDist <= 50) 
+
+dfFilter = dfAll %>% 
+    filter(!agDist %in% c(3,4,5,6)) %>%
+    mutate(sigNew = paste0("Alt_",isAlternative, "_sig_", sig))
+
+nC = dfFilter %>% 
+    group_by(sigNew, agID2) %>% 
+    summarise(mScore = mean(maxEntScore), count = n()) %>%
+    mutate(count = myFormat(count))
+
+ggplot() +
+    geom_boxplot(data = dfFilter, aes(x = agID2, y = maxEntScore, fill = sigNew, color = sigNew), outlier.size = 0.5) +
+    scale_fill_nice_full_b() +
+    scale_color_nice_full_d() +
+    geom_vline(xintercept = 1.5, linetype = "dashed") +
+    geom_text(data = nC, aes(x = agID2, y = mScore, label = count, group = sigNew), position = position_dodge(width = 0.8), angle = 45, size = 3) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+    labs(
+        title = "Strength of putative AGs",
+        subtitle = paste0("NAGNAG sites removed (all=", myFormat(nrow(dfAll)), ", removed=", myFormat(nrow(dfFilter)), ")"),
+        x = "Putative AG",
+        y = "Splice site strength (maxEntScore)",
+        color = "Type",
+        fill = "Type"
+    ) 
+
+ggsave("features_maxEnt_box_v3.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Boxplot - V4
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Splice site strength of putative alternative AG.
+dfFilter = dfFilter %>% mutate(type = ifelse(agID2 == 0, "Canonical", "Putative alternative"))
+nC = dfFilter %>% 
+    group_by(sigNew, type) %>% 
+    summarise(mScore = mean(maxEntScore), count = n()) %>%
+    mutate(count = myFormat(count))
+
+ggplot() +
+    geom_boxplot(data = dfFilter, aes(x = type, y = maxEntScore, fill = sigNew, color = sigNew), outlier.size = 0.5) +
+    scale_fill_nice_full_b() +
+    scale_color_nice_full_d() +
+    geom_vline(xintercept = 1.5, linetype = "dashed") +
+    geom_text(data = nC, aes(x = type, y = mScore, label = count, group = sigNew), position = position_dodge(width = 0.8), angle = 45, size = 3) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+    labs(
+        title = "Strength of putative AGs",
+        subtitle = paste0("NAGNAG sites removed (all=", myFormat(nrow(dfAll)), ", removed=", myFormat(nrow(dfFilter)), ")"),
+        x = "Putative AG",
+        y = "Splice site strength (maxEntScore)",
+        color = "Type",
+        fill = "Type"
+    ) 
+
+ggsave("features_maxEnt_box_v4.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Barchart - V1
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Proportion of alternative AGs within putative AG groups. 79.6% of the 206 putative first AGs are truly used alternatives. 
+df = dfPlot %>%
+    group_by(sig, isAlternative, agID2) %>%
+    tally() %>%
+    group_by(sig, agID2) %>%
+    summarize(sig, isAlternative, agID2, n, grpSum = sum(n)) %>%
+    arrange(agID2) %>%
+    mutate(frac = round((n / grpSum) *100, digits = 1)) %>%
+    filter(isAlternative == "Yes")
+
+ggplot(df, aes(x = agID2, y = frac, fill = sig)) +
+    geom_col(position = position_dodge(preserve = 'single')) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    scale_fill_nice_gr_b() +
+    scale_color_nice_gr_d() +
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    labs(
+        title = "Proportion of alternative AGs",
+        x = "Alternative AG",
+        y = "Proportion of alternative AGs",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_vline(xintercept = 5.5, linetype = "dashed") 
+
+ggsave("features_maxEnt_bar_v1.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Barchart - V2 
+
+```{r, fig.width=4, fig.height=4}
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 4
+#| fig-cap: Number of alternative AGs within putative AG groups.
+df = dfFilter %>% filter(agID2 != 0) %>% 
+    group_by(agID2, sigNew, type) %>% 
+    summarise(n = n()) %>% filter(type == "Putative alternative") %>% 
+    filter(sigNew == "Alt_Yes_sig_FALSE" | sigNew == "Alt_Yes_sig_TRUE")
+
+ggplot(df, aes(x = agID2, y = n, color = sigNew, fill = sigNew, label = n)) +
+    geom_col(position = position_dodge(preserve = 'single')) +
+    theme_pub() +
+    theme(legend.position = "top") +
+    scale_fill_nice_br_b() +
+    scale_color_nice_br_d() +
+    geom_text(position = position_dodge(width = 0.8), angle = 45, size = 3) +
+    labs(
+        title = "Number of alternative AGs per position",
+        x = "Alternative AG",
+        y = "Number of alternative AGs",
+        color = "Significant event",
+        fill = "Significant event"
+    )
+
+ggsave("features_maxEnt_bar_v2.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+:::
+
+
+# Branchpoints at 3' splice sites
+
+Here we use [branchpointer](https://www.bioconductor.org/packages/release/bioc/html/branchpointer.html) to predict branchpoints for each canonical splice sites (AG). The prediction works only in a defined window from -18 to -44nt from the 3' splice site. 
+
+Note that for each event only one search frame is spanned, which is based on the canonical AG. As an alternative approach, a separate window could be spanned for each AG. 
+
+```{r}
+#| label: read branchpointer predictions
+#| message: false
+#| warning: false
+grBpPacBio = readRDS(file = "./data/grBpPacBioBp.rds")
+grBpPacBio$exonID = grBpPacBio$id
+
+grBpPacBio = grBpPacBio[grBpPacBio$exonID %in% ss3PacBioEnd$exonID]
+
+idx = match(grBpPacBio$exonID, ss3PacBioEnd$exonID)
+grBpPacBio$regulation = ss3PacBioEnd$regulation[idx]
+grBpPacBio$sig = ss3PacBioEnd$sig[idx]
+grBpPacBio$sigBp = ifelse(grBpPacBio$branchpoint_prob > 0.52, "Yes", "No")
+
+grBpPacBio$bpID = paste0("BP",names(grBpPacBio), "_", seq_along(grBpPacBio))
+names(grBpPacBio) = grBpPacBio$bpID
+```
+
+
+## Branchpoint integration with splice sites
+
+For most canonical 3' splice sites *branchpointer* predicts one or two branchpoints (above branchpoint significance probability `>0.52`). We keep the best, and if present the second best, prediction and assign them to the canonical splice site.
+
+```{r}
+#| label: Pick best and second best BP
+#| message: false
+#| warning: false
+filterBp = mcols(grBpPacBio) %>%
+    as.data.frame() %>%
+    select(exonID, regulation, sig, sigBp, bpID, to_3prime_point, branchpoint_prob, U2_binding_energy, id) %>%
+    filter(branchpoint_prob > 0.52) %>%
+    group_by(exonID) %>%
+    arrange(exonID, desc(branchpoint_prob)) %>%
+    summarize(exonID, regulation, sig, sigBp, bpID, to_3prime_point, branchpoint_prob, U2_binding_energy, id, bp_order = seq_along(id))
+
+bp1 = filterBp %>% filter(bp_order == 1) # strongest bp
+bp2 = filterBp %>% filter(bp_order == 2) # second strongest bp
+
+grAgPacBio$bp1_prob = bp1$branchpoint_prob[match(grAgPacBio$exonID, bp1$exonID)]
+grAgPacBio$bp1_position = bp1$to_3prime_point[match(grAgPacBio$exonID, bp1$exonID)]
+grAgPacBio$bp1_U2energy = bp1$U2_binding_energy[match(grAgPacBio$exonID, bp1$exonID)]
+grAgPacBio$bp1_bpID = bp1$bpID[match(grAgPacBio$exonID, bp1$exonID)]
+grAgPacBio$bp1_sig = bp1$sigBp[match(grAgPacBio$exonID, bp1$exonID)]
+
+grAgPacBio$bp2_prob = bp2$branchpoint_prob[match(grAgPacBio$exonID, bp2$exonID)]
+grAgPacBio$bp2_position = bp2$to_3prime_point[match(grAgPacBio$exonID, bp2$exonID)]
+grAgPacBio$bp2_U2energy = bp2$U2_binding_energy[match(grAgPacBio$exonID, bp2$exonID)]
+grAgPacBio$bp2_bpID = bp2$bpID[match(grAgPacBio$exonID, bp2$exonID)]
+grAgPacBio$bp2_sig = bp2$sigBp[match(grAgPacBio$exonID, bp2$exonID)]
+
+countVar = subset(grAgPacBio, grAgPacBio$regulation == "shorter_introns" & grAgPacBio$bp1_prob > 0.52)
+```
+
+In total `r myFormat(length(unique(countVar$exonID)))` events have at least one branchpoint above that threshold.
+
+```{r}
+idx = match(bp2$exonID, bp1$exonID)
+d1 = bp1[idx,]
+d2 = bp2
+
+d = table(d1$to_3prime_point > d2$to_3prime_point) %>% 
+    as.data.frame() %>% 
+    mutate(s = sum(Freq)) %>% 
+    mutate(per = Freq / s) %>%
+    mutate(perNice = paste0(round(per, digits = 3) * 100,"%")) %>% 
+    head(1) 
+```
+
+In `r d %>% pull(perNice)` of the cases the stronger branchpoint is closer to the canonical (`r myFormat(d %>% pull(Freq))` from `r myFormat(d %>% pull(s))`). This means that in these `r d %>% pull(perNice)` cases the first branchpoint is also the strongest.
+
+
+::: {.panel-tabset}
+
+### Option 1
+
+```{r, fig.width=8, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Branchpoint and AG distances to canonical 3' splice site. 
+df = grAgPacBio %>%
+    as.data.frame() %>%
+    filter(regulation == "shorter_introns") %>%
+    mutate(agDist = abs(agPosition - 99)) %>%
+    filter(!agDist %in% c(3,4,5,6)) %>%
+    select(agID2, sig, agDist, bp1_position, bp2_position) %>%
+    filter(agID2 %in% c(0,1,2))
+
+df1 = df %>% 
+    filter(agID2 == 0) %>%
+    pivot_longer(-c(agID2, sig)) %>%
+    filter(name %in% c("bp1_position", "bp2_position")) %>%
+    select(sig,name,value) 
+
+df2 = df %>% 
+    pivot_longer(-c(agID2, sig)) %>%
+    filter(name %in% c("agDist")) %>%
+    mutate(name = paste0(name, "_", agID2)) %>%
+    filter(agID2 %in% c(1,2)) %>%
+    select(sig,name,value) 
+
+dfPlot = rbind.data.frame(df1,df2) %>%
+    filter(value <= 50) %>%
+    mutate(value = value * -1) 
+
+nC = dfPlot %>% 
+    group_by(sig, name) %>% 
+    summarise(count = n()) %>%
+    mutate(count = myFormat(count))
+
+statTest = dfPlot %>%
+    group_by(name) %>%
+    t_test(value ~ sig) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "name", dodge = 0.8)
+
+labNames = c("AG1", "AG2", "BP1", "BP2")
+
+ggplot() +
+    annotate(geom = "rect", ymin = 0-21, ymax = 0-12, xmin = -Inf, xmax = Inf, color = NA, fill = "grey", alpha = 0.5)  +
+    geom_boxplot(data = dfPlot, aes(x = name, y = value, fill = sig, color = sig)) +
+    coord_flip() +
+    scale_x_discrete(labels = labNames) +
+    ylim(-50,5) +
+    annotate(geom = "rect", xmin = 0.2, xmax = 0.35, ymin = -50, ymax = 0) +
+    annotate(geom = "rect", xmin = 0.1, xmax = 0.5, ymin = 0, ymax = Inf) +
+    theme_nice() +
+    theme(legend.position = "top") +
+    scale_color_nice_gr_d() +
+    scale_fill_nice_gr_b() +
+    labs(
+        title = "Alternative AG and branchpoint distances relative to canonical 3'SS",
+        subtitle = "BP1 = strongest BP, BP2 = second strongest BP",
+        y = "Distance relative to 3'SS",
+        x = "Selected features",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_text(data = nC, aes(x = name, y = 5, label = count, group = sig), position = position_dodge(width = 0.8), angle = 45, size = 3) +
+    stat_pvalue_manual(data = statTest, label = "p", tip.length = 0.02, size = 3) 
+
+ggsave("maxEnd_Bp_map_v1.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+### Option 2
+
+```{r, fig.width=8, fig.height=6}
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: Branchpoint and AG distances to canonical 3' splice site, with alternative AGs added.
+df = grAgPacBio %>%
+    as.data.frame() %>%
+    filter(regulation == "shorter_introns") %>%
+    mutate(agDist = abs(agPosition - 99)) %>%
+    filter(!agDist %in% c(3,4,5,6)) %>%
+    select(agID2, sig, agDist, bp1_position, bp2_position, isAlternative) %>%
+    filter(agID2 %in% c(0,1,2))
+
+df1 = df %>% 
+    filter(agID2 == 0) %>%
+    pivot_longer(-c(agID2, sig, isAlternative)) %>%
+    filter(name %in% c("bp1_position", "bp2_position")) %>%
+    select(sig,name,value,isAlternative) 
+
+df2 = df %>% 
+    pivot_longer(-c(agID2, sig, isAlternative)) %>%
+    filter(name %in% c("agDist")) %>%
+    mutate(name = paste0(name, "_", agID2)) %>%
+    filter(agID2 %in% c(1,2)) %>%
+    select(sig,name,value,isAlternative) 
+
+df22 = df2 %>% filter(isAlternative == "Yes") %>%
+    mutate(name = "Alt")
+
+df2 = rbind.data.frame(df2, df22) %>% as.data.frame()
+
+dfPlot = rbind.data.frame(df1,df2) %>%
+    filter(value <= 50) %>%
+    mutate(value = value * -1) %>%
+    mutate(name = factor(name, levels = c("Alt", "agDist_1", "agDist_2", "bp1_position", "bp2_position"))) %>%
+    mutate(color = ifelse(name != "Alt" & sig == FALSE, "Evt not sig + Both AG", 
+                          ifelse(name != "Alt" & sig == TRUE, "Evt sig + Both AG",
+                                 ifelse(name == "Alt" & sig == TRUE, "Evt sig + Alt AG", "Evt not sig + Alt AG")))) %>%
+    mutate(color = factor(color, levels = c("Evt not sig + Both AG", "Evt sig + Both AG", "Evt not sig + Alt AG", "Evt sig + Alt AG"))) %>%
+    arrange(color)
+
+nC = dfPlot %>% 
+    group_by(color, name) %>% 
+    summarise(count = n()) %>%
+    mutate(count = myFormat(count))
+
+statTest = dfPlot %>%
+    group_by(name) %>%
+    t_test(value ~ color) %>%
+    adjust_pvalue(method = "BH") %>%
+    add_significance("p.adj") %>%
+    add_xy_position(x = "name", dodge = 0.8)
+
+labNames = c("AG-Alt", "AG-1", "AG-2", "BP-1", "BP-2")
+
+ggplot() +
+    annotate(geom = "rect", ymin = 0-21, ymax = 0-12, xmin = -Inf, xmax = Inf, color = NA, fill = "grey", alpha = 0.5)  +
+    geom_boxplot(data = dfPlot, aes(x = name, y = value, fill = color, color = color)) +
+    coord_flip() +
+    scale_x_discrete(labels = labNames) +
+    ylim(-50,5) +
+    annotate(geom = "rect", xmin = 0.2, xmax = 0.35, ymin = -50, ymax = 0) +
+    annotate(geom = "rect", xmin = 0.1, xmax = 0.5, ymin = 0, ymax = Inf) +
+    theme_nice() +
+    theme(legend.position = "top") +
+    scale_color_nice_full_d() +
+    scale_fill_nice_full_b() +
+    labs(
+        title = "Alternative AG and branchpoint distances relative to canonical 3'SS",
+        subtitle = "BP1 = strongest BP, BP2 = second strongest BP",
+        y = "Distance relative to 3'SS",
+        x = "Selected features",
+        color = "Significant event",
+        fill = "Significant event"
+    ) +
+    geom_text(data = nC, aes(x = name, y = 5, label = count, group = color), position = position_dodge(width = 0.8), angle = 45, size = 3) +
+    stat_pvalue_manual(data = statTest, label = "p", tip.length = 0.02, size = 3) +
+    guides(fill=guide_legend(ncol=2), color=guide_legend(ncol=2))
+
+ggsave("maxEnd_Bp_map_v2.pdf", width = 4, height = 4, device = "pdf", path = "./plots/")
+```
+
+:::
+
+
+# Session Information
+
+```{r, session_info, include=TRUE, echo=TRUE, results='markup'}
+sessionInfo()
+```
