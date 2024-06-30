@@ -1,4 +1,4 @@
-# go_long2023
+# Pacholewska et al. 2024
 
 In this repository the Python notebooks, R-Scrips and Rmarkdown reports are provided. Scripts follow the outlined order:
 
